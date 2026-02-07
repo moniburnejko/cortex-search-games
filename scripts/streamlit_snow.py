@@ -43,6 +43,7 @@ DEFAULT_SCORING = "balanced_default"
 
 # HELPER FUNCTIONS
 
+
 def _escape_sql(val: str) -> str:
     return val.replace("'", "''")
 
@@ -194,7 +195,9 @@ def _row_text_blob(row: dict[str, Any]) -> str:
     return " ".join(parts).lower()
 
 
-def _filter_exclusions(rows: list[dict[str, Any]], exclude: list[str]) -> list[dict[str, Any]]:
+def _filter_exclusions(
+    rows: list[dict[str, Any]], exclude: list[str]
+) -> list[dict[str, Any]]:
     if not exclude:
         return rows
     terms = _normalize_exclusions(exclude)
@@ -269,6 +272,7 @@ def ensure_service_exists() -> None:
 
 
 # MAIN LOGIC
+
 
 def query_service(
     query: str,
@@ -382,7 +386,9 @@ def rewrite_query(
     else:
         exclude = []
         rewritten = _normalize_query(text)
-        looks_like_obj = "query" in rewritten.lower() and "{" in rewritten and "}" in rewritten
+        looks_like_obj = (
+            "query" in rewritten.lower() and "{" in rewritten and "}" in rewritten
+        )
         if looks_like_obj:
             return user_query, [], "LLM returned an invalid query object."
 
