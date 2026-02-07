@@ -26,7 +26,13 @@ Example: {"query": "co-op sci-fi shooter space aliens", "exclude": ["cats"]}
 If there are no exclusions, return an empty list: "exclude": []
 """.strip()
 
-LLM_MODELS = ["claude-4-sonnet", "openai-gpt-5-chat", "llama3.1-70b"]
+LLM_MODELS = [
+    "claude-4-sonnet",
+    "openai-gpt-4.1",
+    "openai-o4-mini",
+    "mistral-large2",
+    "claude-4-opus",
+]
 SCORING_OPTIONS = ["balanced_default", "keyword_focus", "low_latency"]
 DEFAULT_SCORING = "balanced_default"
 
