@@ -195,6 +195,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "ijson" },
     { name = "loguru" },
+    { name = "pytest" },
     { name = "snowflake" },
     { name = "snowflake-connector-python", extra = ["secure-local-storage"] },
     { name = "snowflake-snowpark-python" },
@@ -212,6 +213,7 @@ dev = [
 requires-dist = [
     { name = "ijson", specifier = ">=3.4.0" },
     { name = "loguru", specifier = ">=0.7.3" },
+    { name = "pytest", specifier = ">=9.0.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12.0" },
     { name = "snowflake", specifier = ">=1.11.0" },
