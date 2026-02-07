@@ -1,0 +1,89 @@
+# python env and local config
+.venv/
+venv/
+env/
+ENV/
+
+# env files and secrets
+.env
+.env.*
+*.env
+*.secrets
+secrets.toml
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+connections.toml
+snowsql.cnf
+snowflake_private_key*.pem
+snowflake_private_key*.p8
+
+# python bytecode, caches, tests, coverage
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*$py.class
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.ty/
+.ty_cache/
+.pyre/
+.pytype/
+dmypy.json
+.streamlit/.cache/
+
+# build / packaging artifacts
+build/
+dist/
+wheels/
+site/
+.eggs/
+*.egg
+*.egg-info/
+pip-wheel-metadata/
+
+# sql / local db artifacts
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+
+# logs and temp files
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# os files
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100/
+.Trashes/
+._*
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# editors / ides
+.vscode/
+.idea/
+*.iml
+
+# project-generated artifacts
+data/
+output/
+todo.md
