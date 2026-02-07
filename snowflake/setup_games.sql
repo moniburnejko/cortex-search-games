@@ -3,7 +3,7 @@ use warehouse cortex_wh;
 use database cortex_db;
 use schema cortex_db.raw;
 
--- file format & stage
+-- FILE FORMAT & STAGE --
 create file format if not exists ff_json
   type = json;
   
@@ -21,7 +21,7 @@ create table if not exists games_raw_file (
   load_ts timestamp_ltz
 );
 
--- pipe
+-- PIPE -- 
 create pipe if not exists games_json_pipe
   auto_ingest = true
 as 
@@ -39,31 +39,54 @@ as
 //alter pipe games_json_pipe refresh;
 //select system$pipe_status('CORTEX_DB.RAW.GAMES_JSON_PIPE');
 
--- dynamic tables
+
+-- DYNAMIC TABLES --
+
+-- DT GAMES
+-- flattening the json &
+-- prepare text_search column for cortex search service (semantic index)
 create dynamic table if not exists dt_games
   target_lag = 'DOWNSTREAM'
   warehouse = cortex_wh
 as
 select
   f.value:name::varchar as name,
-  f.value:detailed_description::varchar as detailed_description,
-  f.value:short_description::varchar as short_description,
+  f.value:about_the_game::varchar as about_the_game,
+  try_to_number(regexp_substr(f.value:release_date::varchar, '[0-9]{4}'))::int as release_year,
+  case
+    when is_array(f.value:supported_languages) then to_array(f.value:supported_languages)
+    else array_construct()
+  end as supported_languages,
+  case
+    when is_array(f.value:categories) then to_array(f.value:categories)
+    else array_construct()
+  end as categories,
+  case
+    when is_array(f.value:genres) then to_array(f.value:genres)
+    else array_construct()
+  end as genres,
   case when is_object(f.value:tags) then object_keys(f.value:tags) else array_construct() end as tags,
+
+-- text_search column for cortex search service
   concat_ws(
     ' ',
     coalesce(f.value:name::varchar, ''),
-    coalesce(f.value:detailed_description::varchar, ''),
+    coalesce(f.value:about_the_game::varchar, ''),
+    case when is_array(f.value:categories) then array_to_string(to_array(f.value:categories), ', ') else '' end,
     case when is_object(f.value:tags) then array_to_string(object_keys(f.value:tags), ', ') else '' end
   ) as search_text
 from games_raw_file,
 lateral flatten(input => v) f;
 
+-- DT CAT GAMES
+-- subset of dt_games, just for testing llm rewrite, embaddings, scoring profiles, etc. on smaller dataset
 create dynamic table if not exists dt_cat_games
   target_lag = 'DOWNSTREAM'
   warehouse = cortex_wh
 as 
 select * from dt_games
-where detailed_description ilike '%cats%';
+where search_text ilike '%cats%';
+
 
 //show tables;
 //select * from games_raw_file limit 10;
@@ -73,19 +96,22 @@ where detailed_description ilike '%cats%';
 //select * from dt_cat_games limit 10;
 
     
--- cortex search services
+-- CORTEX SEARCH SERVICES --
 use warehouse cortex_search_wh;
 
 create cortex search service if not exists games_svc
   on search_text
-  attributes (tags)
+  attributes (release_year, supported_languages, categories, genres, tags)
   warehouse = cortex_search_wh
   target_lag = '12 hours'
 as (
   select
     name,
-    short_description,
-    detailed_description,
+    about_the_game,
+    release_year,
+    supported_languages,
+    categories,
+    genres,
     tags,
     search_text
   from dt_games
@@ -93,20 +119,23 @@ as (
 
 create cortex search service if not exists  cat_games_svc
   on search_text
-  attributes (tags)
+  attributes (release_year, supported_languages, categories, genres, tags)
   warehouse = cortex_search_wh
   target_lag = '12 hours'
 as (
   select
     name,
-    short_description,
-    detailed_description,
+    about_the_game,
+    release_year,
+    supported_languages,
+    categories,
+    genres,
     tags,
     search_text
   from dt_cat_games
 );
 
--- named scoring profiles
+-- named SCORING PROFILES --
 alter cortex search service games_svc
   add scoring profile if not exists balanced_default
 '{
