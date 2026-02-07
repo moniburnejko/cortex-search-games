@@ -41,7 +41,7 @@ as
 
 -- dynamic tables
 create dynamic table if not exists dt_games
-  target_lag = '6 hours'
+  target_lag = 'DOWNSTREAM'
   warehouse = cortex_wh
 as
 select
@@ -59,7 +59,7 @@ from games_raw_file,
 lateral flatten(input => v) f;
 
 create dynamic table if not exists dt_cat_games
-  target_lag = '6 hours'
+  target_lag = 'DOWNSTREAM'
   warehouse = cortex_wh
 as 
 select * from dt_games
@@ -80,7 +80,7 @@ create cortex search service if not exists games_svc
   on search_text
   attributes (tags)
   warehouse = cortex_search_wh
-  target_lag = '1 day'
+  target_lag = '12 hours'
 as (
   select
     name,
@@ -95,7 +95,7 @@ create cortex search service if not exists  cat_games_svc
   on search_text
   attributes (tags)
   warehouse = cortex_search_wh
-  target_lag = '1 day'
+  target_lag = '12 hours'
 as (
   select
     name,
