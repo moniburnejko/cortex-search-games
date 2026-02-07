@@ -19,7 +19,15 @@ SCHEMA = "RAW"
 SERVICE = "GAMES_SVC"
 SERVICE_FQN = f"{DB}.{SCHEMA}.{SERVICE}"
 
-RETURN_COLS = ["NAME", "SHORT_DESCRIPTION", "DETAILED_DESCRIPTION", "TAGS"]
+RETURN_COLS = [
+    "NAME",
+    "ABOUT_THE_GAME",
+    "RELEASE_YEAR",
+    "SUPPORTED_LANGUAGES",
+    "CATEGORIES",
+    "GENRES",
+    "TAGS",
+]
 MIN_SCORE = 0.3
 
 DEFAULT_SYSTEM_PROMPT = """
@@ -32,16 +40,15 @@ Preserve user-provided tags/keywords (do not drop them).
 If the query is already good, return it unchanged.
 If you cannot improve it, return the original user query unchanged.
 Do NOT invent game titles. Focus on genres, mechanics, themes, and features.
-Example: {"query": "battle royale building survival shooting multiplayer", "exclude": []}
+Example: {"query": "battle royale building survival shooting multiplayer",
+          "exclude": []}
 Example: {"query": "co-op sci-fi shooter space aliens", "exclude": ["cats"]}
 """.strip()
 
 LLM_MODELS = [
     "claude-4-sonnet",
     "openai-gpt-4.1",
-    "openai-o4-mini",
-    "mistral-large2",
-    "claude-4-opus",
+    "mixtral-8x7b",
 ]
 SCORING_OPTIONS = ["balanced_default", "keyword_focus", "low_latency"]
 DEFAULT_SCORING = "balanced_default"
@@ -148,24 +155,16 @@ def _normalize_query(text: str) -> str:
     return " ".join(_strip_code(text).split()).strip()
 
 
-def _tags(row: dict[str, Any]) -> list[str]:
-    tags = row.get("TAGS") or []
-    if not isinstance(tags, list):
-        return []
-    return [str(v).strip() for v in tags if str(v).strip()]
-
-
 def _scores(row: dict[str, Any]) -> dict[str, Any] | None:
     scores = row.get("@scores")
     return scores if isinstance(scores, dict) else None
 
 
-def _format_tags(row: dict[str, Any]) -> list[str]:
-    tags = row.get("TAGS")
-    if isinstance(tags, list):
-        return [str(v).strip() for v in tags if str(v).strip()]
-    if isinstance(tags, str):
-        txt = tags.strip()
+def _format_str_list(val: Any) -> list[str]:
+    if isinstance(val, list):
+        return [str(v).strip() for v in val if str(v).strip()]
+    if isinstance(val, str):
+        txt = val.strip()
         if txt.startswith("[") and txt.endswith("]"):
             try:
                 parsed = json.loads(txt)
@@ -176,11 +175,31 @@ def _format_tags(row: dict[str, Any]) -> list[str]:
     return []
 
 
+def _format_tags(row: dict[str, Any]) -> list[str]:
+    return _format_str_list(row.get("TAGS"))
+
+
+def _format_langs(row: dict[str, Any]) -> list[str]:
+    return _format_str_list(row.get("SUPPORTED_LANGUAGES"))
+
+
+def _format_categories(row: dict[str, Any]) -> list[str]:
+    return _format_str_list(row.get("CATEGORIES"))
+
+
+def _format_genres(row: dict[str, Any]) -> list[str]:
+    return _format_str_list(row.get("GENRES"))
+
+
 def _row_debug_payload(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "@scores": _scores(row),
         "NAME": row.get("NAME"),
-        "DETAILED_DESCRIPTION": row.get("DETAILED_DESCRIPTION"),
+        "ABOUT_THE_GAME": row.get("ABOUT_THE_GAME"),
+        "RELEASE_YEAR": row.get("RELEASE_YEAR"),
+        "SUPPORTED_LANGUAGES": _format_langs(row),
+        "CATEGORIES": _format_categories(row),
+        "GENRES": _format_genres(row),
         "TAGS": _format_tags(row),
     }
 
@@ -192,12 +211,18 @@ def _normalize_exclusions(exclude: list[str]) -> list[str]:
 def _row_text_blob(row: dict[str, Any]) -> str:
     parts = [
         str(row.get("NAME") or ""),
-        str(row.get("SHORT_DESCRIPTION") or ""),
-        str(row.get("DETAILED_DESCRIPTION") or ""),
+        str(row.get("ABOUT_THE_GAME") or ""),
     ]
-    tags = _format_tags(row)
-    if tags:
-        parts.append(" ".join(tags))
+
+    for vals in (
+        _format_tags(row),
+        _format_genres(row),
+        _format_categories(row),
+        _format_langs(row),
+    ):
+        if vals:
+            parts.append(" ".join(vals))
+
     return " ".join(parts).lower()
 
 
@@ -480,39 +505,19 @@ def show_results(
     scores = [_row_score(row) for row in rows]
     if rows and all(score is None for score in scores):
         st.info("Scores are missing in results. Min score filtering is disabled")
-    elif rows:
-        sources = {_score_source(row) for row in rows}
 
     for idx, row in enumerate(rows[:limit], start=1):
         name = row.get("NAME")
-        short = row.get("SHORT_DESCRIPTION") or ""
-        detailed = row.get("DETAILED_DESCRIPTION") or ""
-        tags = _tags(row)
+        about = row.get("ABOUT_THE_GAME") or ""
         score = _row_score(row)
-        score_parts = _scores(row)
 
         with st.container():
             st.markdown(f"### {idx}. {name}")
 
-            if short:
-                excerpt = short if len(short) <= 400 else f"{short[:400].rstrip()}..."
+            if about:
+                excerpt = about if len(about) <= 400 else f"{about[:400].rstrip()}..."
                 st.write(excerpt)
-                if detailed and detailed.strip() and detailed != short:
-                    with st.expander("See detailed description", expanded=False):
-                        st.write(detailed)
-            elif detailed:
-                excerpt = (
-                    detailed
-                    if len(detailed) <= 400
-                    else f"{detailed[:400].rstrip()}..."
-                )
-                st.write(excerpt)
-                if len(detailed) > 400:
-                    with st.expander("See more", expanded=False):
-                        st.write(detailed)
 
-            if tags:
-                st.caption(f"Tags: {', '.join(tags)}")
             with st.expander("Ranking components (@scores)", expanded=False):
                 if score is not None:
                     st.write(f"Score: {score:.3f}")
@@ -559,8 +564,8 @@ def main() -> None:
             q = rewritten
             with st.expander("LLM rewritten query", expanded=False):
                 st.code(q)
-            if exclude_terms:
-                st.caption(f"Excluded terms: {', '.join(exclude_terms)}")
+                if exclude_terms:
+                    st.caption(f"Excluded terms: {', '.join(exclude_terms)}")
 
     rows = query_service(
         q,

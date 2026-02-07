@@ -39,6 +39,7 @@ def _coerce_dict(parsed: Any) -> dict[str, Any] | None:
 
 def try_parse_rewrite_payload(text: str) -> tuple[str | None, list[str]]:
     txt = strip_code_fences(text)
+
     start = txt.find("{")
     end = txt.rfind("}")
 
@@ -143,6 +144,7 @@ def _normalize_exclusions(exclude: list[str]) -> list[str]:
 def _row_text_blob(row: dict[str, Any]) -> str:
     parts = [
         str(row.get("NAME") or ""),
+        str(row.get("ABOUT_THE_GAME") or ""),
         str(row.get("SHORT_DESCRIPTION") or ""),
         str(row.get("DETAILED_DESCRIPTION") or ""),
     ]
@@ -320,7 +322,9 @@ def rewrite_query_with_llm(
     else:
         exclude = []
         rewritten = normalize_rewritten_query(text)
-        looks_like_obj = "query" in rewritten.lower() and "{" in rewritten and "}" in rewritten
+        looks_like_obj = (
+            "query" in rewritten.lower() and "{" in rewritten and "}" in rewritten
+        )
         if looks_like_obj:
             return user_query, [], "LLM returned an invalid query object."
 

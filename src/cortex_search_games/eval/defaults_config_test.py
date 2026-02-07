@@ -9,7 +9,15 @@ SCHEMA = "RAW"
 SERVICE = "CAT_GAMES_SVC"
 SERVICE_FQN = f"{DB}.{SCHEMA}.{SERVICE}"
 
-RETURN_COLS = ["NAME", "SHORT_DESCRIPTION", "DETAILED_DESCRIPTION", "TAGS"]
+RETURN_COLS = [
+    "NAME",
+    "ABOUT_THE_GAME",
+    "RELEASE_YEAR",
+    "SUPPORTED_LANGUAGES",
+    "CATEGORIES",
+    "GENRES",
+    "TAGS",
+]
 MIN_SCORE = 0.3
 
 DEFAULT_SYSTEM_PROMPT = """
@@ -29,9 +37,7 @@ If there are no exclusions, return an empty list: "exclude": []
 LLM_MODELS = [
     "claude-4-sonnet",
     "openai-gpt-4.1",
-    "openai-o4-mini",
-    "mistral-large2",
-    "claude-4-opus",
+    "mixtral-8x7b",
 ]
 SCORING_OPTIONS = ["balanced_default", "keyword_focus", "low_latency"]
 DEFAULT_SCORING = "balanced_default"
