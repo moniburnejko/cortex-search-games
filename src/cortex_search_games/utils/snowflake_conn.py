@@ -72,8 +72,10 @@ def norm_conn(raw: dict[str, Any]) -> dict[str, Any]:
 
     take("account")
     take("user")
+    take("role")
     take("warehouse")
     take("database")
+    take("schema")
     take("authenticator")
 
     pk_path = raw.get("private_key_path")
