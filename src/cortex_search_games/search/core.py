@@ -112,12 +112,11 @@ def normalize_rewritten_query(text: str) -> str:
     return " ".join(strip_code_fences(text).split()).strip()
 
 
-def _format_tags(row: dict[str, Any]) -> list[str]:
-    tags = row.get("TAGS")
-    if isinstance(tags, list):
-        return [str(v).strip() for v in tags if str(v).strip()]
-    if isinstance(tags, str):
-        txt = tags.strip()
+def _format_str_list(val: Any) -> list[str]:
+    if isinstance(val, list):
+        return [str(v).strip() for v in val if str(v).strip()]
+    if isinstance(val, str):
+        txt = val.strip()
         if txt.startswith("[") and txt.endswith("]"):
             try:
                 parsed = json.loads(txt)
@@ -126,6 +125,22 @@ def _format_tags(row: dict[str, Any]) -> list[str]:
             if isinstance(parsed, list):
                 return [str(v).strip() for v in parsed if str(v).strip()]
     return []
+
+
+def _format_tags(row: dict[str, Any]) -> list[str]:
+    return _format_str_list(row.get("TAGS"))
+
+
+def _format_langs(row: dict[str, Any]) -> list[str]:
+    return _format_str_list(row.get("SUPPORTED_LANGUAGES"))
+
+
+def _format_categories(row: dict[str, Any]) -> list[str]:
+    return _format_str_list(row.get("CATEGORIES"))
+
+
+def _format_genres(row: dict[str, Any]) -> list[str]:
+    return _format_str_list(row.get("GENRES"))
 
 
 def result_tags(row: dict[str, Any]) -> list[str]:
@@ -145,12 +160,17 @@ def _row_text_blob(row: dict[str, Any]) -> str:
     parts = [
         str(row.get("NAME") or ""),
         str(row.get("ABOUT_THE_GAME") or ""),
-        str(row.get("SHORT_DESCRIPTION") or ""),
-        str(row.get("DETAILED_DESCRIPTION") or ""),
     ]
-    tags = _format_tags(row)
-    if tags:
-        parts.append(" ".join(tags))
+
+    for vals in (
+        _format_tags(row),
+        _format_genres(row),
+        _format_categories(row),
+        _format_langs(row),
+    ):
+        if vals:
+            parts.append(" ".join(vals))
+
     return " ".join(parts).lower()
 
 
@@ -215,12 +235,73 @@ def resolve_candidate_limit(
     return min(max_candidates, max(min_candidates, limit * candidate_factor))
 
 
+def _normalize_filter_values(values: Sequence[str] | None) -> list[str]:
+    if not values:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        txt = str(raw).strip()
+        if not txt:
+            continue
+        key = txt.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(txt)
+
+    return out
+
+
+def _build_attribute_filter(
+    *,
+    tags: Sequence[str] | None = None,
+    genres: Sequence[str] | None = None,
+    release_year: int | None = None,
+    supported_languages: Sequence[str] | None = None,
+) -> dict[str, Any] | None:
+    clauses: list[dict[str, Any]] = []
+
+    for tag in _normalize_filter_values(tags):
+        clauses.append({"@contains": {"tags": tag}})
+
+    for genre in _normalize_filter_values(genres):
+        clauses.append({"@contains": {"genres": genre}})
+
+    if release_year is not None:
+        if isinstance(release_year, bool):
+            raise ValueError("release_year must be an integer")
+        try:
+            year = int(release_year)
+        except (TypeError, ValueError) as err:
+            raise ValueError("release_year must be an integer") from err
+        if year <= 0:
+            raise ValueError("release_year must be > 0")
+        clauses.append({"@eq": {"release_year": year}})
+
+    for language in _normalize_filter_values(supported_languages):
+        clauses.append({"@contains": {"supported_languages": language}})
+
+    if not clauses:
+        return None
+
+    if len(clauses) == 1:
+        return clauses[0]
+
+    return {"@and": clauses}
+
+
 def _build_search_payload(
     *,
     query: str,
     cols: Sequence[str],
     limit: int,
     profile: str | None,
+    tags: Sequence[str] | None = None,
+    genres: Sequence[str] | None = None,
+    release_year: int | None = None,
+    supported_languages: Sequence[str] | None = None,
 ) -> str:
     if not query.strip():
         raise ValueError("query cannot be empty")
@@ -236,6 +317,16 @@ def _build_search_payload(
         "columns": cols_list,
         "limit": limit,
     }
+
+    attr_filter = _build_attribute_filter(
+        tags=tags,
+        genres=genres,
+        release_year=release_year,
+        supported_languages=supported_languages,
+    )
+    if attr_filter:
+        req["filter"] = attr_filter
+
     if profile:
         req["scoring_profile"] = profile
 
@@ -272,11 +363,12 @@ def rewrite_query_with_llm(
     user_query: str,
     model: str,
     temperature: float,
+    max_tokens: int = 120,
     system_prompt: str,
 ) -> tuple[str, list[str], str | None]:
     user_prompt = f"User query: {user_query}"
     prompt = f"{system_prompt}\n\n{user_prompt}"
-    opts = {"temperature": float(temperature), "max_tokens": 120}
+    opts = {"temperature": float(temperature), "max_tokens": int(max_tokens)}
 
     opts_json = json.dumps(opts, ensure_ascii=False)
 
@@ -343,12 +435,20 @@ def query_cortex_search_service(
     candidate_limit: int,
     scoring_profile: str | None,
     min_score: float | None,
+    tags: Sequence[str] | None = None,
+    genres: Sequence[str] | None = None,
+    release_year: int | None = None,
+    supported_languages: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     req_json = _build_search_payload(
         query=query,
         cols=columns,
         limit=candidate_limit,
         profile=scoring_profile,
+        tags=tags,
+        genres=genres,
+        release_year=release_year,
+        supported_languages=supported_languages,
     )
 
     sql = """
