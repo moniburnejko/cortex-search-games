@@ -10,13 +10,13 @@ from snowflake.snowpark.exceptions import SnowparkSQLException
 
 PAGE_TITLE = "Find your new fave game"
 PAGE_ICON = "🎮"
-APP_TITLE = "🎮 Find your new fave game 🎮"
+APP_TITLE = "Find your new fave game"
 APP_CAPTION = "Semantic search over the Steam games catalog (Snowflake Cortex Search)."
-QUERY_PLACEHOLDER = "e.g. battle royale with building, looting resources, and combat"
+QUERY_PLACEHOLDER = "I want a co-op survival game, but not horror."
 
 DB = "CORTEX_DB"
 SCHEMA = "RAW"
-SERVICE = "GAMES_SVC"
+SERVICE = "GAMES_SVC_1_5"
 SERVICE_FQN = f"{DB}.{SCHEMA}.{SERVICE}"
 
 RETURN_COLS = [
@@ -29,6 +29,8 @@ RETURN_COLS = [
     "TAGS",
 ]
 MIN_SCORE = 0.3
+MAX_DEBUG_SCAN_ROWS = 50
+DEFAULT_LLM_MAX_TOKENS = 120
 
 DEFAULT_SYSTEM_PROMPT = """
 You rewrite user queries for semantic search over a video games catalog.
@@ -50,7 +52,15 @@ LLM_MODELS = [
     "openai-gpt-4.1",
     "mixtral-8x7b",
 ]
-SCORING_OPTIONS = ["balanced_default", "keyword_focus", "low_latency"]
+SCORING_OPTIONS = [
+    "balanced_default",
+    "keyword_focus",
+    "semantic_focus",
+    "keyword_extreme",
+    "no_reranker_balanced",
+    "low_latency",
+    "reranker_heavy",
+]
 DEFAULT_SCORING = "balanced_default"
 
 
@@ -302,24 +312,165 @@ def ensure_service_exists() -> None:
         st.stop()
 
 
+def _row_to_dict(row: Any) -> dict[str, Any]:
+    if isinstance(row, dict):
+        return row
+
+    for attr in ("asDict", "as_dict"):
+        fn = getattr(row, attr, None)
+        if callable(fn):
+            try:
+                return fn()
+            except TypeError:
+                try:
+                    return fn(recursive=True)
+                except TypeError:
+                    return fn()
+
+    if hasattr(row, "keys") and callable(row.keys):
+        try:
+            keys = list(row.keys())
+            return {str(k): row[k] for k in keys}
+        except Exception:
+            pass
+
+    return {"_row": str(row)}
+
+
+def _source_table_for_service(service_name: str) -> str:
+    service_upper = service_name.upper()
+    if "CAT_GAMES" in service_upper:
+        return "DT_CAT_GAMES"
+    return "DT_GAMES"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_attribute_filter_options(service_name: str) -> dict[str, Any]:
+    sess = get_active_session()
+    source_table = _source_table_for_service(service_name)
+    table_fqn = f"{DB}.{SCHEMA}.{source_table}"
+
+    tags_sql = f"""
+    SELECT DISTINCT TRIM(value::string) AS VAL
+    FROM {table_fqn},
+         LATERAL FLATTEN(input => TAGS)
+    WHERE value IS NOT NULL
+      AND TRIM(value::string) <> ''
+    ORDER BY VAL
+    """
+
+    langs_sql = f"""
+    SELECT DISTINCT TRIM(value::string) AS VAL
+    FROM {table_fqn},
+         LATERAL FLATTEN(input => SUPPORTED_LANGUAGES)
+    WHERE value IS NOT NULL
+      AND TRIM(value::string) <> ''
+    ORDER BY VAL
+    """
+
+    try:
+        tag_rows = sess.sql(tags_sql).collect()
+        lang_rows = sess.sql(langs_sql).collect()
+    except SnowparkSQLException as err:
+        return {
+            "tags": [],
+            "supported_languages": [],
+            "error": str(err),
+        }
+
+    return {
+        "tags": [str(row[0]) for row in tag_rows if row[0] is not None],
+        "supported_languages": [str(row[0]) for row in lang_rows if row[0] is not None],
+        "error": None,
+    }
+
+
+def _build_attribute_filter(
+    *,
+    tags: list[str] | None,
+    supported_languages: list[str] | None,
+) -> dict[str, Any] | None:
+    clauses: list[dict[str, Any]] = []
+
+    for tag in tags or []:
+        clauses.append({"@contains": {"tags": tag}})
+
+    for language in supported_languages or []:
+        clauses.append({"@contains": {"supported_languages": language}})
+
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"@and": clauses}
+
+
+def describe_service() -> list[dict[str, Any]]:
+    sess = get_active_session()
+    try:
+        rows = sess.sql(f"DESC CORTEX SEARCH SERVICE {SERVICE_FQN}").collect()
+    except SnowparkSQLException as err:
+        return [{"error": str(err)}]
+
+    return [_row_to_dict(row) for row in rows]
+
+
+def cortex_search_data_scan(limit: int) -> list[dict[str, Any]]:
+    sess = get_active_session()
+    n = max(1, min(int(limit), MAX_DEBUG_SCAN_ROWS))
+    svc = _escape_sql(SERVICE_FQN)
+
+    sql = f"""
+    SELECT *
+    FROM TABLE(
+      CORTEX_SEARCH_DATA_SCAN(
+        SERVICE_NAME => '{svc}'
+      )
+    )
+    LIMIT {n}
+    """
+
+    try:
+        rows = sess.sql(sql).collect()
+    except SnowparkSQLException as err:
+        st.warning(f"CORTEX_SEARCH_DATA_SCAN failed for `{SERVICE_FQN}`: {err}")
+        return []
+
+    return [_row_to_dict(row) for row in rows]
+
+
 # MAIN LOGIC
 
 
-def query_service(
+def _build_search_request(
+    *,
     query: str,
+    columns: list[str],
     cand_limit: int,
     scoring: str | None,
-    min_score: float | None,
-) -> list[dict[str, Any]]:
-    sess = get_active_session()
-
-    req = {
+    tags: list[str] | None = None,
+    supported_languages: list[str] | None = None,
+) -> dict[str, Any]:
+    req: dict[str, Any] = {
         "query": query,
-        "columns": RETURN_COLS,
+        "columns": columns,
         "limit": cand_limit,
     }
+
+    attr_filter = _build_attribute_filter(
+        tags=tags,
+        supported_languages=supported_languages,
+    )
+    if attr_filter:
+        req["filter"] = attr_filter
+
     if scoring:
         req["scoring_profile"] = scoring
+    return req
+
+
+def search_preview(req: dict[str, Any]) -> dict[str, Any]:
+    sess = get_active_session()
 
     req_json = _escape_sql(json.dumps(req, ensure_ascii=False))
 
@@ -329,38 +480,56 @@ def query_service(
             '{SERVICE_FQN}',
             '{req_json}'
         )
-    )['results'] AS RESULTS
+    ) AS RESP
     """
 
     raw = sess.sql(sql).collect()[0][0]
-    rows = json.loads(raw) if isinstance(raw, str) else raw
+    parsed = json.loads(raw) if isinstance(raw, str) else raw
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def extract_results(resp: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = resp.get("results")
+    if isinstance(rows, str):
+        try:
+            rows = json.loads(rows)
+        except json.JSONDecodeError:
+            rows = None
 
     if not isinstance(rows, list):
         return []
 
-    out = [row for row in rows if isinstance(row, dict)]
-    if min_score is not None and min_score > 0:
-        scores = [_row_score(row) for row in out]
-        if any(score is not None for score in scores):
-            out = [
-                row
-                for row, score in zip(out, scores, strict=False)
-                if score is not None and score >= min_score
-            ]
+    return [row for row in rows if isinstance(row, dict)]
 
-    return out
+
+def filter_min_score(
+    rows: list[dict[str, Any]], min_score: float | None
+) -> list[dict[str, Any]]:
+    if min_score is None or min_score <= 0:
+        return rows
+
+    scores = [_row_score(row) for row in rows]
+    if not any(score is not None for score in scores):
+        return rows
+
+    return [
+        row
+        for row, score in zip(rows, scores, strict=False)
+        if score is not None and score >= min_score
+    ]
 
 
 def rewrite_query(
     user_query: str,
     model: str,
     temp: float,
+    max_tokens: int,
 ) -> tuple[str, list[str], str | None]:
     sess = get_active_session()
     user_prompt = f"User query: {user_query}"
     prompt = f"{DEFAULT_SYSTEM_PROMPT}\n\n{user_prompt}"
 
-    opts = {"temperature": float(temp), "max_tokens": 120}
+    opts = {"temperature": float(temp), "max_tokens": int(max_tokens)}
     opts_json = json.dumps(opts, ensure_ascii=False)
 
     sql = """
@@ -429,33 +598,76 @@ def rewrite_query(
     return rewritten, exclude, None
 
 
-def render_form() -> dict[str, Any]:
+def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
     with st.form("search_form"):
         query = st.text_input(
             "Describe the game you want to find",
             placeholder=QUERY_PLACEHOLDER,
             key="query",
         )
-        limit = int(
-            st.number_input("Results to show", min_value=1, value=10, key="limit")
-        )
-        cand_limit = min(500, max(50, limit * 10))
 
-        with st.expander("LLM rewrite (optional)", expanded=False):
+        if filter_options.get("error"):
+            st.warning(
+                "Couldn't load attribute values from the dataset. "
+                "Attribute filters are temporarily unavailable."
+            )
+
+        limit = int(
+            st.number_input(
+                "Results to show",
+                min_value=1,
+                max_value=50,
+                value=10,
+                step=1,
+                key="limit",
+            )
+        )
+        filter_tags = st.multiselect(
+            "Tags",
+            options=filter_options.get("tags", []),
+            default=[],
+            placeholder="Type to search tags...",
+            key="filter_tags",
+        )
+        filter_supported_languages = st.multiselect(
+            "Languages",
+            options=filter_options.get("supported_languages", []),
+            default=[],
+            placeholder="Type to search languages...",
+            key="filter_supported_languages",
+        )
+
+        with st.expander("LLM rewrite", expanded=False):
             use_llm = st.checkbox("Rewrite query with LLM", value=True, key="use_llm")
             llm_model = st.selectbox(
                 "LLM model", options=LLM_MODELS, index=0, key="llm_model"
             )
+            llm_max_tokens = int(
+                st.number_input(
+                    "LLM max tokens",
+                    min_value=64,
+                    max_value=256,
+                    value=DEFAULT_LLM_MAX_TOKENS,
+                    step=8,
+                    key="llm_max_tokens",
+                    help=(
+                        "120 recommended. Lower = shorter rewrites; "
+                        "higher = richer rewrites but slower/less focused."
+                    ),
+                )
+            )
             llm_temp = st.slider(
-                "LLM temperature (lower = predictable, higher = diverse)",
+                "LLM temperature",
                 min_value=0.0,
                 max_value=0.6,
                 value=0.0,
                 step=0.05,
                 key="llm_temperature",
+                help="Lower = predictable, higher = diverse.",
             )
-
-        with st.expander("Ranking tuning (optional)", expanded=False):
+        with st.expander("Ranking tuning", expanded=False):
+            auto_cand_limit = min(500, max(50, limit * 10))
+            cand_limit = auto_cand_limit
             scoring = st.selectbox(
                 "Scoring profile",
                 options=SCORING_OPTIONS,
@@ -464,12 +676,57 @@ def render_form() -> dict[str, Any]:
                 format_func=lambda v: v if v else "Default service ranking",
             )
             min_score = st.slider(
-                "Minimum score threshold (0 = no filtering)",
+                "Minimum score threshold",
                 min_value=0.0,
                 max_value=1.0,
                 value=MIN_SCORE,
                 step=0.05,
                 key="min_score",
+                help=(
+                    "0 = no filtering, 0.3 = minimum, "
+                    "0.6-0.7 recommended, >0.7 = strict."
+                ),
+            )
+        with st.expander("Debugging", expanded=False):
+            debug_include_search_text = st.checkbox(
+                "Include SEARCH_TEXT in results (debug)",
+                value=True,
+                key="debug_include_search_text",
+            )
+            debug_show_request = st.checkbox(
+                "Show request JSON (SEARCH_PREVIEW)",
+                value=True,
+                key="debug_show_request",
+            )
+            debug_show_response = st.checkbox(
+                "Show raw response (SEARCH_PREVIEW)",
+                value=True,
+                key="debug_show_response",
+            )
+            debug_show_desc = st.checkbox(
+                "Show service describe (DESC CORTEX SEARCH SERVICE)",
+                value=True,
+                key="debug_show_desc",
+            )
+            debug_show_scan = st.checkbox(
+                "Show index data scan (CORTEX_SEARCH_DATA_SCAN)",
+                value=True,
+                key="debug_show_scan",
+            )
+            debug_scan_limit = int(
+                st.number_input(
+                    "Data scan rows",
+                    min_value=1,
+                    max_value=MAX_DEBUG_SCAN_ROWS,
+                    value=5,
+                    step=1,
+                    key="debug_scan_limit",
+                )
+            )
+            debug_show_vectors = st.checkbox(
+                "Show embedding vectors in scan (heavy)",
+                value=False,
+                key="debug_show_vectors",
             )
 
         submitted = st.form_submit_button(
@@ -483,8 +740,18 @@ def render_form() -> dict[str, Any]:
         "use_llm": use_llm,
         "llm_model": llm_model,
         "llm_temp": llm_temp,
+        "llm_max_tokens": llm_max_tokens,
+        "filter_tags": filter_tags,
+        "filter_supported_languages": filter_supported_languages,
         "scoring": scoring,
         "min_score": min_score,
+        "debug_include_search_text": debug_include_search_text,
+        "debug_show_request": debug_show_request,
+        "debug_show_response": debug_show_response,
+        "debug_show_desc": debug_show_desc,
+        "debug_show_scan": debug_show_scan,
+        "debug_scan_limit": debug_scan_limit,
+        "debug_show_vectors": debug_show_vectors,
         "submitted": submitted,
     }
 
@@ -523,6 +790,13 @@ def show_results(
                     st.write(f"Score: {score:.3f}")
                 else:
                     st.write("Score: n/a")
+                score_src = _score_source(row)
+                if score_src:
+                    st.caption(f"Score source: {score_src}")
+                search_text = row.get("SEARCH_TEXT") or ""
+                if search_text:
+                    st.caption("SEARCH_TEXT (indexed)")
+                    st.code(search_text)
                 st.json(_row_debug_payload(row))
 
         st.divider()
@@ -540,7 +814,8 @@ def main() -> None:
     st.caption(APP_CAPTION)
 
     ensure_service_exists()
-    form = render_form()
+    filter_options = load_attribute_filter_options(SERVICE)
+    form = render_form(filter_options)
 
     if not form["submitted"]:
         if not form["query"]:
@@ -553,10 +828,15 @@ def main() -> None:
         return
 
     exclude_terms: list[str] = []
+    cand_limit = min(500, max(50, int(form["limit"]) * 10))
+
     if form["use_llm"]:
         with st.spinner("Rewriting your query for better results..."):
             rewritten, exclude_terms, err = rewrite_query(
-                q, form["llm_model"], form["llm_temp"]
+                q,
+                form["llm_model"],
+                form["llm_temp"],
+                form["llm_max_tokens"],
             )
         if err:
             st.warning(f"LLM: {err} Using the original query")
@@ -567,14 +847,84 @@ def main() -> None:
                 if exclude_terms:
                     st.caption(f"Excluded terms: {', '.join(exclude_terms)}")
 
-    rows = query_service(
-        q,
-        form["cand_limit"],
-        form["scoring"] or None,
-        form["min_score"],
+    cols = list(RETURN_COLS)
+    if form["debug_include_search_text"] and "SEARCH_TEXT" not in cols:
+        cols.append("SEARCH_TEXT")
+
+    req = _build_search_request(
+        query=q,
+        columns=cols,
+        cand_limit=cand_limit,
+        scoring=form["scoring"] or None,
+        tags=form["filter_tags"],
+        supported_languages=form["filter_supported_languages"],
     )
+
+    resp = search_preview(req)
+    rows = filter_min_score(extract_results(resp), form["min_score"])
     rows = _filter_exclusions(rows, exclude_terms)
-    show_results(rows, form["limit"], form["cand_limit"])
+
+    if any(
+        (
+            form["debug_show_request"],
+            form["debug_show_response"],
+            form["debug_show_desc"],
+            form["debug_show_scan"],
+        )
+    ):
+        with st.expander("Debug: Service & Index", expanded=False):
+            request_id = resp.get("request_id")
+            if request_id:
+                st.caption(f"request_id: {request_id}")
+
+            if form["debug_show_request"]:
+                st.subheader("SEARCH_PREVIEW request")
+                st.json(req)
+
+            if form["debug_show_response"]:
+                st.subheader("SEARCH_PREVIEW response (metadata)")
+                meta = {k: v for k, v in resp.items() if k != "results"}
+                meta["results_count"] = len(extract_results(resp))
+                st.json(meta)
+
+            if form["debug_show_desc"]:
+                st.subheader("DESC CORTEX SEARCH SERVICE")
+                st.dataframe(describe_service())
+
+            if form["debug_show_scan"]:
+                st.subheader("CORTEX_SEARCH_DATA_SCAN (sample)")
+                scan_rows = cortex_search_data_scan(form["debug_scan_limit"])
+                if scan_rows:
+                    embed_cols = [
+                        str(k)
+                        for k in scan_rows[0]
+                        if str(k).startswith("_GENERATED_EMBEDDINGS_")
+                    ]
+                    if embed_cols:
+                        st.caption(f"Embedding columns: {', '.join(embed_cols)}")
+
+                    if form["debug_show_vectors"]:
+                        st.dataframe(scan_rows)
+                    else:
+                        preview: list[dict[str, Any]] = []
+                        for row in scan_rows:
+                            item: dict[str, Any] = {
+                                "NAME": row.get("NAME"),
+                                "SEARCH_TEXT": (row.get("SEARCH_TEXT") or "")[:200],
+                            }
+                            for col in embed_cols:
+                                vec = row.get(col)
+                                dim = None
+                                if vec is not None and not isinstance(vec, str):
+                                    try:
+                                        dim = len(vec)
+                                    except Exception:
+                                        dim = None
+                                item[f"{col}__dim"] = dim
+                            preview.append(item)
+                        st.dataframe(preview)
+
+    show_results(rows, form["limit"], cand_limit)
 
 
 if __name__ == "__main__":
