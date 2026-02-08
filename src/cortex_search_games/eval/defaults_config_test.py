@@ -1,12 +1,12 @@
 PAGE_TITLE = "Find your new fave cat game"
 PAGE_ICON = "🐱"
-APP_TITLE = "🐱 Find your new fave cat game 🐱"
+APP_TITLE = "Find your new fave cat game"
 APP_CAPTION = "and help me find if my search app likes to hallucinate like Cheshire Cat"
 QUERY_PLACEHOLDER = "e.g. co-op with cats in Japan"
 
 DB = "CORTEX_DB"
 SCHEMA = "RAW"
-SERVICE = "CAT_GAMES_SVC"
+SERVICE = "CAT_GAMES_SVC_1_5"
 SERVICE_FQN = f"{DB}.{SCHEMA}.{SERVICE}"
 
 RETURN_COLS = [
@@ -39,7 +39,13 @@ LLM_MODELS = [
     "openai-gpt-4.1",
     "mixtral-8x7b",
 ]
-SCORING_OPTIONS = ["balanced_default", "keyword_focus", "low_latency"]
+SCORING_OPTIONS = [
+    "balanced_default",
+    "semantic_focus",
+    "keyword_extreme",
+    "no_reranker_balanced",
+    "reranker_heavy",
+]
 DEFAULT_SCORING = "balanced_default"
 
 LOCAL_CONN_NAME = "cortex"
