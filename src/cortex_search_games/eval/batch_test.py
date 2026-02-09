@@ -1,5 +1,7 @@
+import argparse
 import csv
 import json
+import os
 import sys
 import time
 from datetime import UTC, datetime
@@ -17,7 +19,7 @@ from cortex_search_games.search.core import (
     resolve_candidate_limit,
     result_scores,
     result_tags,
-    rewrite_query_with_llm,
+    rewrite_query_with_llm_details,
     row_score,
 )
 from cortex_search_games.utils.snowflake_conn import get_session
@@ -46,7 +48,6 @@ SCORE_TH = (0.3, 0.65, 0.75, 0.85)
 LLM_MODELS = (
     "claude-4-sonnet",
     "openai-gpt-4.1",
-    "mixtral-8x7b",
 )
 TEMPS = (0.0, 0.6)
 USE_LLM = (False, True)
@@ -54,21 +55,89 @@ QUERIES = (
     "Is \"Hidden Cats in Krakow\" in the catalog? if not, show closest hidden cats city games",
     "Cat Quest IV - if it's not, show me similar pirate cat action RPG (NOT Cat Quest II)",
     "battle royale cat game set on Mars, but NOT shooting, NOT multiplayer, NOT violence",
-    "cozy cat cafe management sim, but NOT a visual novel, NOT anime, avoid dating sim",
-    "third-person cat adventure in a city, no horror, no gore",
-    "hidden object cats in a city, without timer, exclude leaderboard, avoid time attack",
-    "neon cybercity cat adventure with a drone companion, stealthy exploration, mysterious robots",
-    "a lone cat in a neon, decaying city of robots; exploration, stealth, mystery (3rd person)",
-    "catventure: open-world 2D action RPG with cats and dogs, local co-op, loot and spells",
 )
 
 SERVICE = "CORTEX_DB.RAW.CAT_GAMES_SVC_1_5"
+SOURCE_TABLE = "CORTEX_DB.RAW.DT_CAT_GAMES"
 LIMIT = 10
 CAND_FACTOR = 10
 MAX_CAND = 500
 
 DEFAULT_SYSTEM_PROMPT = """
-You rewrite user queries for hybrid (keyword + vector) search over a video games catalog.
+You rewrite user queries for hybrid (keyword + vector) search
+over a video games catalog.
+
+Return ONLY a valid JSON object with exactly five keys:
+"query", "include_tags", "exclude", "release_year", "supported_languages".
+
+Hard requirements:
+- Output MUST be valid JSON (double quotes, no trailing commas).
+- Output MUST be a single JSON object and nothing else.
+- Output MUST be a single line.
+- Do NOT wrap the JSON in markdown fences/backticks and do NOT add explanations.
+- Always include all keys:
+  - "query": a string
+  - "include_tags": an array of strings (use [] if none)
+  - "exclude": an array of strings (use [] if none)
+  - "release_year": an integer year or null
+  - "supported_languages": an array of strings (use [] if none)
+- Do NOT return JSON as a string (no extra quotes around the whole object).
+- Do NOT add any additional keys.
+
+Input format:
+- The user query will appear as a line starting with: User query:
+- Use only that text as the input query to rewrite.
+
+Rewrite rules:
+- "query" must be short, English, keyword-rich,
+  suitable for hybrid (keyword + vector) search.
+- Prefer 5–20 keywords / short phrases, not full sentences (less noise for embeddings).
+- Preserve user-provided keywords/tags (do not drop them).
+- Preserve concrete mechanic/mode/tag terms literally (helps keyword stage).
+- Add synonyms only when needed; avoid over-expansion that makes the query too generic.
+- Do NOT invent game titles. Focus on genres, mechanics, themes, and features.
+- If the query is already good, return it unchanged (normalize whitespace only).
+
+Attribute extraction:
+- Put in "include_tags" only explicit, non-negated user terms
+  that look like tags/themes.
+- If a term appears in "exclude", it must NOT appear in "include_tags" or "query".
+- Extract "release_year" only when explicitly requested
+  as a single year (otherwise null).
+- Extract "supported_languages" only when explicitly requested.
+
+Exclusions and negations:
+- If the user explicitly excludes something via negation (no/without/not/avoid/exclude),
+  add that term to "exclude".
+- "exclude" items should be simple keywords/tags, lowercase, no punctuation.
+- Exclusions have priority over the main query and include_tags.
+
+Examples:
+Input: User query: co-op multiplayer games set in Japan without cats
+Output: {"query":"co-op multiplayer Japan","include_tags":[],"exclude":["cats"],
+"release_year":null,"supported_languages":[]}
+
+Input: User query: battle royale with building, looting resources, and combat
+Output: {"query":"battle royale building looting combat","include_tags":[],
+"exclude":[],"release_year":null,"supported_languages":[]}
+
+Input: User query: puzzle game not horror, no gore
+Output: {"query":"puzzle","include_tags":[],"exclude":["horror","gore"],
+"release_year":null,"supported_languages":[]}
+
+Input: User query: i want to play something like cyberpunk but with cats, no multiplayer
+Output: {"query":"cyberpunk cats futuristic sci-fi single player",
+"include_tags":["cyberpunk","cats"],"exclude":["multiplayer"],
+"release_year":null,"supported_languages":[]}
+
+Input: User query: french hidden object game from 2022 without timer
+Output: {"query":"hidden object","include_tags":[],"exclude":["timer"],
+"release_year":2022,"supported_languages":["french"]}
+""".strip()
+
+BASELINE_SYSTEM_PROMPT = """
+You rewrite user queries for hybrid (keyword + vector) search
+over a video games catalog.
 
 Return ONLY a valid JSON object with exactly two keys: "query" and "exclude".
 
@@ -114,7 +183,18 @@ Input: User query: puzzle game not horror, no gore
 Output: {"query":"puzzle","exclude":["horror","gore"]}
 """.strip()
 
-SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+SCENARIOS = (
+    {
+        "name": "default",
+        "system_prompt": DEFAULT_SYSTEM_PROMPT,
+        "use_attribute_filters": True,
+    },
+    {
+        "name": "baseline",
+        "system_prompt": BASELINE_SYSTEM_PROMPT,
+        "use_attribute_filters": False,
+    },
+)
 LLM_MAX_TOKENS = 120
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -124,7 +204,22 @@ OUTPUT_FILE = "test_emb_1_5_p1"
 CONN_NAME = "cortex"
 CONN_TOML: Path | None = None
 LOG_LEVEL = "DEBUG"
-COLLECT_SQL_METRICS = False
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+COLLECT_SQL_METRICS = _env_bool("COLLECT_SQL_METRICS", True)
 
 
 QUERY_HISTORY_SQL = """
@@ -207,6 +302,83 @@ def _sum_optional_ints(values: tuple[int | None, ...]) -> int | None:
     if not vals:
         return None
     return sum(vals)
+
+
+def _normalize_values(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        txt = str(raw).strip()
+        if not txt:
+            continue
+        key = txt.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(txt)
+    return out
+
+
+def _match_known(values: list[str], known: set[str]) -> tuple[list[str], list[str]]:
+    if not values:
+        return [], []
+    matched: list[str] = []
+    missing: list[str] = []
+    for val in _normalize_values(values):
+        if val.lower() in known:
+            matched.append(val)
+        else:
+            missing.append(val)
+    return matched, missing
+
+
+def _extract_options(session: Session, source_table: str) -> dict[str, Any]:
+    tags_sql = f"""
+    SELECT DISTINCT TRIM(value::string) AS VAL
+    FROM {source_table},
+         LATERAL FLATTEN(input => TAGS)
+    WHERE value IS NOT NULL
+      AND TRIM(value::string) <> ''
+    ORDER BY VAL
+    """
+    langs_sql = f"""
+    SELECT DISTINCT TRIM(value::string) AS VAL
+    FROM {source_table},
+         LATERAL FLATTEN(input => SUPPORTED_LANGUAGES)
+    WHERE value IS NOT NULL
+      AND TRIM(value::string) <> ''
+    ORDER BY VAL
+    """
+    years_sql = f"""
+    SELECT DISTINCT RELEASE_YEAR AS VAL
+    FROM {source_table}
+    WHERE RELEASE_YEAR IS NOT NULL
+    ORDER BY VAL DESC
+    """
+
+    tags_rows = session.sql(tags_sql).collect()
+    langs_rows = session.sql(langs_sql).collect()
+    years_rows = session.sql(years_sql).collect()
+
+    tags = [str(row[0]).strip() for row in tags_rows if row[0] is not None]
+    langs = [str(row[0]).strip() for row in langs_rows if row[0] is not None]
+    years: list[int] = []
+    for row in years_rows:
+        raw = row[0]
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            year = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if year > 0:
+            years.append(year)
+
+    return {
+        "tags": _normalize_values(tags),
+        "supported_languages": _normalize_values(langs),
+        "release_years": sorted(set(years), reverse=True),
+    }
 
 
 def _empty_query_history_metrics(query_id: str) -> dict[str, Any]:
@@ -435,10 +607,12 @@ def run_batch(
     temps: tuple[float, ...] = TEMPS,
     llm_max_tokens: int = LLM_MAX_TOKENS,
     svc: str = SERVICE,
+    source_table: str = SOURCE_TABLE,
     limit: int = LIMIT,
     cand_factor: int = CAND_FACTOR,
     max_cand: int = MAX_CAND,
-    sys_prompt: str = SYSTEM_PROMPT,
+    sys_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    scenarios: tuple[dict[str, Any], ...] | None = None,
     out_dir: Path = OUTPUT_DIR,
     out_file: str = OUTPUT_FILE,
     conn_name: str = CONN_NAME,
@@ -458,6 +632,11 @@ def run_batch(
         max_cand,
     )
 
+    if scenarios is None:
+        scenarios = SCENARIOS
+    if not scenarios:
+        raise ValueError("scenarios cannot be empty")
+
     with get_session(conn_name, conn_toml) as session:
         ensure_service_exists(session, svc)
 
@@ -466,6 +645,16 @@ def run_batch(
             candidate_factor=cand_factor,
             max_candidates=max_cand,
         )
+
+        options: dict[str, Any] | None = None
+        tags_known: set[str] = set()
+        langs_known: set[str] = set()
+        years_known: set[int] = set()
+        if any(bool(scenario.get("use_attribute_filters")) for scenario in scenarios):
+            options = _extract_options(session, source_table)
+            tags_known = {tag.lower() for tag in options["tags"]}
+            langs_known = {lang.lower() for lang in options["supported_languages"]}
+            years_known = set(options["release_years"])
 
         cfgs = iter_cfgs(profiles, score_th, llm_flags, llm_models, temps)
         req_count = 0
@@ -480,149 +669,225 @@ def run_batch(
         )
 
         for q in queries:
-            for cfg in cfgs:
-                req_count += 1
-                rew_q = q
-                rew_err = ""
-                rew_ms = 0
-                rewrite_query_id = ""
-                rewrite_history = _empty_query_history_metrics("")
-                search_query_id = ""
-                search_history = _empty_query_history_metrics("")
+            for scenario in scenarios:
+                for cfg in cfgs:
+                    req_count += 1
+                    rew_q = q
+                    rew_err = ""
+                    rew_ms = 0
+                    rewrite_query_id = ""
+                    rewrite_history = _empty_query_history_metrics("")
+                    search_query_id = ""
+                    search_history = _empty_query_history_metrics("")
 
-                exclude_terms: list[str] = []
-                if cfg["use_llm"]:
-                    t0 = time.perf_counter()
-                    try:
-                        rew_q, exclude_terms, err = rewrite_query_with_llm(
-                            session,
-                            user_query=q,
-                            model=cfg["model"] or "",
-                            temperature=cfg["temp"] or 0.0,
-                            max_tokens=llm_max_tokens,
-                            system_prompt=sys_prompt,
+                    exclude_terms: list[str] = []
+                    include_tags_raw: list[str] = []
+                    include_langs_raw: list[str] = []
+                    year_int: int | None = None
+                    matched_tags: list[str] = []
+                    unknown_tags: list[str] = []
+                    matched_langs: list[str] = []
+                    unknown_langs: list[str] = []
+                    matched_year: int | None = None
+
+                    if cfg["use_llm"]:
+                        t0 = time.perf_counter()
+                        try:
+                            rewrite, err = rewrite_query_with_llm_details(
+                                session,
+                                user_query=q,
+                                model=cfg["model"] or "",
+                                temperature=cfg["temp"] or 0.0,
+                                max_tokens=llm_max_tokens,
+                                system_prompt=str(
+                                    scenario.get("system_prompt") or sys_prompt
+                                ),
+                            )
+                        except Exception as e:
+                            logger.error(f"LLM Rewrite failed for query '{q}': {e}")
+                            rewrite, err = None, str(e)
+
+                        if rewrite is None:
+                            rewrite = {
+                                "query": q,
+                                "exclude": [],
+                                "include_tags": [],
+                                "release_year": None,
+                                "supported_languages": [],
+                            }
+
+                        rew_q = str(rewrite.get("query") or q)
+                        exclude_terms = _normalize_values(
+                            [str(v).lower() for v in list(rewrite.get("exclude") or [])]
                         )
-                    except Exception as e:
-                        logger.error(f"LLM Rewrite failed for query '{q}': {e}")
-                        rew_q, exclude_terms, err = q, [], str(e)
+                        include_tags_raw = _normalize_values(
+                            list(rewrite.get("include_tags") or [])
+                        )
+                        include_langs_raw = _normalize_values(
+                            list(rewrite.get("supported_languages") or [])
+                        )
+                        year_raw = rewrite.get("release_year")
+                        if year_raw is None or isinstance(year_raw, bool):
+                            year_int = None
+                        else:
+                            try:
+                                year_int = int(year_raw)
+                            except (TypeError, ValueError):
+                                year_int = None
 
-                    rew_ms = round((time.perf_counter() - t0) * 1000)
-                    rew_err = err or ""
+                        rew_ms = round((time.perf_counter() - t0) * 1000)
+                        rew_err = err or ""
+                        if COLLECT_SQL_METRICS:
+                            rewrite_query_id = _last_query_id(session)
+                            rewrite_history = _query_history_metrics(
+                                session, rewrite_query_id
+                            )
+
+                    use_attr = bool(scenario.get("use_attribute_filters"))
+                    if use_attr and options is not None:
+                        matched_tags, unknown_tags = _match_known(
+                            include_tags_raw, tags_known
+                        )
+                        matched_langs, unknown_langs = _match_known(
+                            include_langs_raw, langs_known
+                        )
+                        matched_year = year_int if year_int in years_known else None
+
+                    attr_tags = matched_tags if use_attr else []
+                    attr_langs = matched_langs if use_attr else []
+                    attr_year = matched_year if use_attr else None
+
+                    t1 = time.perf_counter()
+                    results = query_cortex_search_service(
+                        session,
+                        service_fqn=svc,
+                        query=rew_q,
+                        columns=cols,
+                        candidate_limit=cand_limit,
+                        scoring_profile=cfg["profile"],
+                        min_score=cfg["min_score"],
+                        tags=attr_tags,
+                        supported_languages=attr_langs,
+                        release_year=attr_year,
+                    )
+                    if not isinstance(results, list):
+                        results = list(results)
+
+                    results = filter_exclusions(results, exclude_terms)
+                    search_ms = round((time.perf_counter() - t1) * 1000)
                     if COLLECT_SQL_METRICS:
-                        rewrite_query_id = _last_query_id(session)
-                        rewrite_history = _query_history_metrics(
-                            session, rewrite_query_id
+                        search_query_id = _last_query_id(session)
+                        search_history = _query_history_metrics(
+                            session, search_query_id
                         )
 
-                t1 = time.perf_counter()
-                results = query_cortex_search_service(
-                    session,
-                    service_fqn=svc,
-                    query=rew_q,
-                    columns=cols,
-                    candidate_limit=cand_limit,
-                    scoring_profile=cfg["profile"],
-                    min_score=cfg["min_score"],
-                )
-                if not isinstance(results, list):
-                    results = list(results)
-
-                results = filter_exclusions(results, exclude_terms)
-                search_ms = round((time.perf_counter() - t1) * 1000)
-                if COLLECT_SQL_METRICS:
-                    search_query_id = _last_query_id(session)
-                    search_history = _query_history_metrics(session, search_query_id)
-
-                ts = datetime.now(UTC).isoformat(timespec="seconds")
-                request_cost_credits = _sum_optional_floats(
-                    (
-                        _to_float(rewrite_history["cost_total_credits"]),
-                        _to_float(search_history["cost_total_credits"]),
+                    ts = datetime.now(UTC).isoformat(timespec="seconds")
+                    request_cost_credits = _sum_optional_floats(
+                        (
+                            _to_float(rewrite_history["cost_total_credits"]),
+                            _to_float(search_history["cost_total_credits"]),
+                        )
                     )
-                )
-                request_total_elapsed_ms = _sum_optional_ints(
-                    (
-                        _to_int(rewrite_history["total_elapsed_ms"]),
-                        _to_int(search_history["total_elapsed_ms"]),
+                    request_total_elapsed_ms = _sum_optional_ints(
+                        (
+                            _to_int(rewrite_history["total_elapsed_ms"]),
+                            _to_int(search_history["total_elapsed_ms"]),
+                        )
                     )
-                )
-                request_common: dict[str, Any] = {
-                    "timestamp_utc": ts,
-                    "service": svc,
-                    "original_query": q,
-                    "rewritten_query": rew_q,
-                    "excluded_terms": exclude_terms,
-                    "rewrite_error": rew_err,
-                    "use_llm": cfg["use_llm"],
-                    "llm_model": cfg["model"] or "",
-                    "llm_max_tokens": llm_max_tokens if cfg["use_llm"] else "",
-                    "temperature": cfg["temp"] if cfg["temp"] is not None else "",
-                    "scoring_profile": cfg["profile"] or "",
-                    "min_score": cfg["min_score"],
-                    "limit": limit,
-                    "candidate_limit": cand_limit,
-                    "rewrite_ms": rew_ms,
-                    "search_ms": search_ms,
-                    "request_ms": rew_ms + search_ms,
-                    "rewrite_query_id": rewrite_query_id,
-                    "search_query_id": search_query_id,
-                    "rewrite_total_elapsed_ms": rewrite_history["total_elapsed_ms"],
-                    "search_total_elapsed_ms": search_history["total_elapsed_ms"],
-                    "request_total_elapsed_ms": request_total_elapsed_ms,
-                    "rewrite_cost_total_credits": rewrite_history["cost_total_credits"],
-                    "search_cost_total_credits": search_history["cost_total_credits"],
-                    "request_cost_total_credits": request_cost_credits,
-                    "rewrite_cost_cloud_services_credits": rewrite_history[
-                        "cost_cloud_services_credits"
-                    ],
-                    "search_cost_cloud_services_credits": search_history[
-                        "cost_cloud_services_credits"
-                    ],
-                    "rewrite_cost_compute_credits": rewrite_history[
-                        "cost_compute_credits"
-                    ],
-                    "search_cost_compute_credits": search_history[
-                        "cost_compute_credits"
-                    ],
-                    "rewrite_cost_query_accel_credits": rewrite_history[
-                        "cost_query_accel_credits"
-                    ],
-                    "search_cost_query_accel_credits": search_history[
-                        "cost_query_accel_credits"
-                    ],
-                }
-
-                request_rows.append(
-                    request_common
-                    | {
-                        "result_count": len(results),
-                        "result_count_after_limit": len(results[:limit]),
+                    request_common: dict[str, Any] = {
+                        "timestamp_utc": ts,
+                        "service": svc,
+                        "scenario": scenario.get("name") or "",
+                        "original_query": q,
+                        "rewritten_query": rew_q,
+                        "excluded_terms": exclude_terms,
+                        "rewrite_error": rew_err,
+                        "use_llm": cfg["use_llm"],
+                        "llm_model": cfg["model"] or "",
+                        "llm_max_tokens": llm_max_tokens if cfg["use_llm"] else "",
+                        "temperature": cfg["temp"] if cfg["temp"] is not None else "",
+                        "scoring_profile": cfg["profile"] or "",
+                        "min_score": cfg["min_score"],
+                        "limit": limit,
+                        "candidate_limit": cand_limit,
+                        "rewrite_ms": rew_ms,
+                        "search_ms": search_ms,
+                        "request_ms": rew_ms + search_ms,
+                        "rewrite_query_id": rewrite_query_id,
+                        "search_query_id": search_query_id,
+                        "rewrite_total_elapsed_ms": rewrite_history["total_elapsed_ms"],
+                        "search_total_elapsed_ms": search_history["total_elapsed_ms"],
+                        "request_total_elapsed_ms": request_total_elapsed_ms,
+                        "rewrite_cost_total_credits": rewrite_history[
+                            "cost_total_credits"
+                        ],
+                        "search_cost_total_credits": search_history[
+                            "cost_total_credits"
+                        ],
+                        "request_cost_total_credits": request_cost_credits,
+                        "rewrite_cost_cloud_services_credits": rewrite_history[
+                            "cost_cloud_services_credits"
+                        ],
+                        "search_cost_cloud_services_credits": search_history[
+                            "cost_cloud_services_credits"
+                        ],
+                        "rewrite_cost_compute_credits": rewrite_history[
+                            "cost_compute_credits"
+                        ],
+                        "search_cost_compute_credits": search_history[
+                            "cost_compute_credits"
+                        ],
+                        "rewrite_cost_query_accel_credits": rewrite_history[
+                            "cost_query_accel_credits"
+                        ],
+                        "search_cost_query_accel_credits": search_history[
+                            "cost_query_accel_credits"
+                        ],
+                        "include_tags_raw": include_tags_raw,
+                        "include_tags_matched": matched_tags,
+                        "include_tags_unknown": unknown_tags,
+                        "supported_languages_raw": include_langs_raw,
+                        "supported_languages_matched": matched_langs,
+                        "supported_languages_unknown": unknown_langs,
+                        "release_year_raw": year_int,
+                        "release_year_matched": matched_year,
+                        "attribute_filters_enabled": use_attr,
+                        "attribute_filter_tags": attr_tags,
+                        "attribute_filter_supported_languages": attr_langs,
+                        "attribute_filter_release_year": attr_year,
                     }
-                )
 
-                for rank, row in enumerate(results[:limit], start=1):
-                    rows.append(
+                    request_rows.append(
                         request_common
                         | {
-                            "result_rank": rank,
-                            "result_name": row.get("NAME"),
-                            "result_score": row_score(row),
-                            "release_year": row.get("RELEASE_YEAR"),
-                            "supported_languages": ";".join(
-                                _format_str_list(row.get("SUPPORTED_LANGUAGES"))
-                            ),
-                            "categories": ";".join(
-                                _format_str_list(row.get("CATEGORIES"))
-                            ),
-                            "genres": ";".join(_format_str_list(row.get("GENRES"))),
-                            "tags": ";".join(result_tags(row)),
-                            "about_the_game": (row.get("ABOUT_THE_GAME") or "")[:500],
-                            "scores_json": json.dumps(
-                                result_scores(row) or {},
-                                ensure_ascii=False,
-                            ),
+                            "result_count": len(results),
+                            "result_count_after_limit": len(results[:limit]),
                         }
                     )
+
+                    for rank, row in enumerate(results[:limit], start=1):
+                        rows.append(
+                            request_common
+                            | {
+                                "result_rank": rank,
+                                "result_name": row.get("NAME"),
+                                "result_score": row_score(row),
+                                "release_year": row.get("RELEASE_YEAR"),
+                                "supported_languages": ";".join(
+                                    _format_str_list(row.get("SUPPORTED_LANGUAGES"))
+                                ),
+                                "categories": ";".join(
+                                    _format_str_list(row.get("CATEGORIES"))
+                                ),
+                                "genres": ";".join(_format_str_list(row.get("GENRES"))),
+                                "tags": ";".join(result_tags(row)),
+                                "about_the_game": (row.get("ABOUT_THE_GAME") or "")[:500],
+                                "scores_json": json.dumps(
+                                    result_scores(row) or {},
+                                    ensure_ascii=False,
+                                ),
+                            }
+                        )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / out_file
@@ -652,11 +917,38 @@ def run_batch(
     }
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run batch evaluation with selectable LLM prompt scenario.",
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=("default", "baseline", "all"),
+        default="default",
+        help=(
+            "Which prompt scenario to run. "
+            "'default' uses the filter-aware prompt from streamlit_snow.py, "
+            "'baseline' uses the non-filter-aware prompt, "
+            "'all' runs both."
+        ),
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
     setup_log()
 
     try:
-        summary = run_batch()
+        args = _parse_args()
+        if args.scenario == "all":
+            scenarios = SCENARIOS
+        else:
+            scenarios = tuple(
+                scenario for scenario in SCENARIOS if scenario["name"] == args.scenario
+            )
+        suffix = args.scenario
+        out_file = f"{OUTPUT_FILE}_{suffix}"
+        summary = run_batch(scenarios=scenarios, out_file=out_file)
     except (RuntimeError, ValueError) as err:
         logger.error("Batch run failed: {}", err)
         return 1
