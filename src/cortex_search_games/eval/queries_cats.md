@@ -2,7 +2,7 @@
 ```python
 QUERIES = (
     "cozy cat cafe management sim, but NOT a visual novel, NOT anime, avoid dating sim",
-    "third-person cat adventure in a city, no horror, no gore,
+    "third-person cat adventure in a city, no horror, no gore" ,
     "hidden object cats in a city, without timer, exclude leaderboard, avoid time attack",
     "Is \"Hidden Cats in Krakow\" in the catalog? if not, do not invent it; show closest hidden cats city games",
     "Cat Quest IV - if it's not in the catalog, show me similar pirate cat action RPG (NOT Cat Quest II)",
@@ -44,7 +44,7 @@ QUERIES = (
 ```python
 QUERIES = (
     "cozy cat cafe management sim, but NOT a visual novel, NOT anime, avoid dating sim",
-    "third-person cat adventure in a city, no horror, no gore,
+    "third-person cat adventure in a city, no horror, no gore",
     "hidden object cats in a city, without timer, exclude leaderboard, avoid time attack",
 )
 ```
