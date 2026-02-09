@@ -436,7 +436,9 @@ def query_cortex_search_service(
     try:
         resp = svc.search(**search_args)
     except Exception as err:
-        raise RuntimeError(f"Cortex search failed for service {service_fqn}: {err}") from err
+        raise RuntimeError(
+            f"Cortex search failed for service {service_fqn}: {err}"
+        ) from err
 
     rows = resp.results
     # Ensure rows is a list of dicts

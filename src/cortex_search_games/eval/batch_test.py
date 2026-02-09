@@ -119,7 +119,7 @@ LLM_MAX_TOKENS = 120
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 OUTPUT_DIR = PROJECT_ROOT / "output"
-OUTPUT_FILE = "test_drift_1_5"
+OUTPUT_FILE = "test_emb_1_5_p1"
 
 CONN_NAME = "cortex"
 CONN_TOML: Path | None = None
@@ -510,7 +510,9 @@ def run_batch(
                     rew_err = err or ""
                     if COLLECT_SQL_METRICS:
                         rewrite_query_id = _last_query_id(session)
-                        rewrite_history = _query_history_metrics(session, rewrite_query_id)
+                        rewrite_history = _query_history_metrics(
+                            session, rewrite_query_id
+                        )
 
                 t1 = time.perf_counter()
                 results = query_cortex_search_service(

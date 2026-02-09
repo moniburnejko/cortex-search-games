@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+from snowflake.core import Root
 from snowflake.snowpark.context import get_active_session
 from snowflake.snowpark.exceptions import SnowparkSQLException
-from snowflake.core import Root
 
 # DEFAULTS CONFIGURATION
 
@@ -108,6 +108,7 @@ def _get_local_session():
     if str(src_path) not in sys.path:
         sys.path.append(str(src_path))
     from cortex_search_games.utils.snowflake_conn import get_session
+
     return get_session("cortex")
 
 
@@ -661,17 +662,17 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
                 "Couldn't load attribute values from the dataset. "
                 "Attribute filters are temporarily unavailable."
             )
-
+        # TODO: checkbox: SHOW ALL (no limit), and if checked, then cad_limit -> FULL
         limit = int(
             st.number_input(
                 "Results to show",
                 min_value=1,
-                max_value=50,
                 value=10,
                 step=1,
                 key="limit",
             )
         )
+
         filter_tags = st.multiselect(
             "Tags",
             options=filter_options.get("tags", []),
@@ -716,8 +717,18 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
                 help="Lower = predictable, higher = diverse.",
             )
         with st.expander("Ranking tuning", expanded=False):
-            auto_cand_limit = min(500, max(50, limit * 10))
-            cand_limit = auto_cand_limit
+            # TODO: first eg pills (auto, full, custom), and if custom then you can enter a number input.
+            # or just connect it to limit (if show all then full, if not then auto)
+            cand_limit = st.selectbox(
+                "Candidate results to retrieve (for scoring/filtering)",
+                options=["AUTO", "FULL", 50, 100, 250, 500, 1000], 
+                index=0, 
+                key="cand_limit",
+                help=(
+                    "Higher = better results but slower. "
+                    "AUTO = 10x the display limit, "
+                    "FULL = all candidates (no limit)")
+            )
             scoring = st.selectbox(
                 "Scoring profile",
                 options=SCORING_OPTIONS,
@@ -878,7 +889,14 @@ def main() -> None:
         return
 
     exclude_terms: list[str] = []
-    cand_limit = min(500, max(50, int(form["limit"]) * 10))
+
+    if cand_limit := form["cand_limit"]:
+        if cand_limit == "AUTO":
+            cand_limit = form["limit"] * 10
+        elif cand_limit == "FULL":
+            cand_limit = None
+        else:
+            cand_limit = int(cand_limit)
 
     if form["use_llm"]:
         with st.spinner("Rewriting your query for better results..."):

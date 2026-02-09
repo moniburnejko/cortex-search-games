@@ -405,14 +405,10 @@ def _load_selected_runs(
         result_parts.append(_prepare_results(result_df, run_name=run.run_name))
 
     requests = (
-        pd.concat(request_parts, ignore_index=True)
-        if request_parts
-        else pd.DataFrame()
+        pd.concat(request_parts, ignore_index=True) if request_parts else pd.DataFrame()
     )
     results = (
-        pd.concat(result_parts, ignore_index=True)
-        if result_parts
-        else pd.DataFrame()
+        pd.concat(result_parts, ignore_index=True) if result_parts else pd.DataFrame()
     )
     return requests, results
 
