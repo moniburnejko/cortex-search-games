@@ -1,13 +1,19 @@
 import ast
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
 from snowflake.core import Root
+from snowflake.core.exceptions import APIError
 from snowflake.snowpark.context import get_active_session
-from snowflake.snowpark.exceptions import SnowparkSQLException
+from snowflake.snowpark.exceptions import (
+    SnowparkClientException,
+    SnowparkSessionException,
+    SnowparkSQLException,
+)
 
 # DEFAULTS CONFIGURATION
 
@@ -31,23 +37,30 @@ RETURN_COLS = [
     "GENRES",
     "TAGS",
 ]
-MIN_SCORE = 0.3
+MIN_SCORE = 0.75
+SHOW_ALL_MIN_SCORE = 0.75
+MAX_CORTEX_SEARCH_LIMIT = 1000
 MAX_DEBUG_SCAN_ROWS = 50
 DEFAULT_LLM_MAX_TOKENS = 120
 
 DEFAULT_SYSTEM_PROMPT = """
-You rewrite user queries for hybrid (keyword + vector) search over a video games catalog.
+You rewrite user queries for hybrid (keyword + vector) search
+over a video games catalog.
 
-Return ONLY a valid JSON object with exactly two keys: "query" and "exclude".
+Return ONLY a valid JSON object with exactly five keys:
+"query", "include_tags", "exclude", "release_year", "supported_languages".
 
 Hard requirements:
 - Output MUST be valid JSON (double quotes, no trailing commas).
 - Output MUST be a single JSON object and nothing else.
 - Output MUST be a single line.
 - Do NOT wrap the JSON in markdown fences/backticks and do NOT add explanations.
-- Always include both keys:
+- Always include all keys:
   - "query": a string
-  - "exclude": an array of strings (use [] if there are no exclusions)
+  - "include_tags": an array of strings (use [] if none)
+  - "exclude": an array of strings (use [] if none)
+  - "release_year": an integer year or null
+  - "supported_languages": an array of strings (use [] if none)
 - Do NOT return JSON as a string (no extra quotes around the whole object).
 - Do NOT add any additional keys.
 
@@ -56,7 +69,8 @@ Input format:
 - Use only that text as the input query to rewrite.
 
 Rewrite rules:
-- "query" must be short, English, keyword-rich, suitable for hybrid (keyword + vector) search.
+- "query" must be short, English, keyword-rich,
+  suitable for hybrid (keyword + vector) search.
 - Prefer 5–20 keywords / short phrases, not full sentences (less noise for embeddings).
 - Preserve user-provided keywords/tags (do not drop them).
 - Preserve concrete mechanic/mode/tag terms literally (helps keyword stage).
@@ -64,28 +78,46 @@ Rewrite rules:
 - Do NOT invent game titles. Focus on genres, mechanics, themes, and features.
 - If the query is already good, return it unchanged (normalize whitespace only).
 
-Exclusions:
+Attribute extraction:
+- Put in "include_tags" only explicit, non-negated user terms
+  that look like tags/themes.
+- If a term appears in "exclude", it must NOT appear in "include_tags" or "query".
+- Extract "release_year" only when explicitly requested
+  as a single year (otherwise null).
+- Extract "supported_languages" only when explicitly requested.
+
+Exclusions and negations:
 - If the user explicitly excludes something via negation (no/without/not/avoid/exclude),
   add that term to "exclude".
 - "exclude" items should be simple keywords/tags, lowercase, no punctuation.
-- Exclusions have priority over the main query. If a term is in "exclude", it should not appear in "query".
-- If there are no exclusions, return "exclude": [].
+- Exclusions have priority over the main query and include_tags.
 
 Examples:
 Input: User query: co-op multiplayer games set in Japan without cats
-Output: {"query":"co-op multiplayer Japan","exclude":["cats"]}
+Output: {"query":"co-op multiplayer Japan","include_tags":[],"exclude":["cats"],
+"release_year":null,"supported_languages":[]}
 
 Input: User query: battle royale with building, looting resources, and combat
-Output: {"query":"battle royale building looting combat","exclude":[]}
+Output: {"query":"battle royale building looting combat","include_tags":[],
+"exclude":[],"release_year":null,"supported_languages":[]}
 
 Input: User query: puzzle game not horror, no gore
-Output: {"query":"puzzle","exclude":["horror","gore"]}
+Output: {"query":"puzzle","include_tags":[],"exclude":["horror","gore"],
+"release_year":null,"supported_languages":[]}
+
+Input: User query: i want to play something like cyberpunk but with cats, no multiplayer
+Output: {"query":"cyberpunk cats futuristic sci-fi single player",
+"include_tags":["cyberpunk","cats"],"exclude":["multiplayer"],
+"release_year":null,"supported_languages":[]}
+
+Input: User query: french hidden object game from 2022 without timer
+Output: {"query":"hidden object","include_tags":[],"exclude":["timer"],
+"release_year":2022,"supported_languages":["french"]}
 """.strip()
 
 LLM_MODELS = [
     "claude-4-sonnet",
     "openai-gpt-4.1",
-    "mixtral-8x7b",
 ]
 SCORING_OPTIONS = [
     "balanced_default",
@@ -115,7 +147,7 @@ def _get_local_session():
 def _get_session():
     try:
         return get_active_session()
-    except Exception:
+    except (SnowparkClientException, SnowparkSessionException):
         return _get_local_session()
 
 
@@ -152,7 +184,68 @@ def _coerce_dict(parsed: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _try_parse_payload(text: str) -> tuple[str | None, list[str]]:
+def _normalize_filter_values(values: list[str] | None) -> list[str]:
+    if not values:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        txt = str(raw).strip()
+        if not txt:
+            continue
+        key = txt.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(txt)
+    return out
+
+
+def _normalize_filter_list(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    return _normalize_filter_values([str(v) for v in raw])
+
+
+def _merge_filter_terms(*term_lists: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for terms in term_lists:
+        for raw in terms:
+            term = str(raw).strip()
+            if not term:
+                continue
+            key = term.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(term)
+    return out
+
+
+def _normalize_release_year(raw: Any) -> int | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        year = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if year <= 0:
+        return None
+    return year
+
+
+def _empty_rewrite_payload(user_query: str) -> dict[str, Any]:
+    return {
+        "query": user_query,
+        "exclude": [],
+        "include_tags": [],
+        "release_year": None,
+        "supported_languages": [],
+    }
+
+
+def _try_parse_payload_details(text: str) -> dict[str, Any] | None:
     txt = _strip_code(text)
     start = txt.find("{")
     end = txt.rfind("}")
@@ -177,22 +270,38 @@ def _try_parse_payload(text: str) -> tuple[str | None, list[str]]:
         if parsed_dict is None:
             continue
 
-        query = parsed_dict.get("query")
-        if not isinstance(query, str):
+        query_raw = parsed_dict.get("query")
+        if not isinstance(query_raw, str):
             continue
 
-        query = query.strip()
+        query = query_raw.strip()
         if not query:
             continue
 
-        exclude_raw = parsed_dict.get("exclude", [])
-        exclude: list[str] = []
-        if isinstance(exclude_raw, list):
-            exclude = [str(v).strip() for v in exclude_raw if str(v).strip()]
+        include_tags = _normalize_filter_list(
+            parsed_dict.get("include_tags", parsed_dict.get("filters", []))
+        )
+        supported_languages = _normalize_filter_list(
+            parsed_dict.get("supported_languages", parsed_dict.get("languages", []))
+        )
+        release_year = _normalize_release_year(
+            parsed_dict.get("release_year", parsed_dict.get("year"))
+        )
+        exclude = _merge_filter_terms(
+            _normalize_filter_list(parsed_dict.get("exclude", [])),
+            _normalize_filter_list(parsed_dict.get("exclude_terms", [])),
+            _normalize_filter_list(parsed_dict.get("exclude_tags", [])),
+        )
 
-        return query, exclude
+        return {
+            "query": query,
+            "exclude": exclude,
+            "include_tags": include_tags,
+            "release_year": release_year,
+            "supported_languages": supported_languages,
+        }
 
-    return None, []
+    return None
 
 
 def _extract_text(resp: dict[str, Any]) -> str | None:
@@ -215,6 +324,214 @@ def _extract_text(resp: dict[str, Any]) -> str | None:
 
 def _normalize_query(text: str) -> str:
     return " ".join(_strip_code(text).split()).strip()
+
+
+_NEGATION_MARKER_RE = re.compile(
+    r"\b(?:exclude|excluding|without|avoid|avoiding|not|no)\b",
+    flags=re.IGNORECASE,
+)
+_PUNCT_SEP_RE = re.compile(r"[,;:/|]+")
+_PROMPT_META_TOKENS = {
+    "add",
+    "assistant",
+    "comment",
+    "comments",
+    "exclude",
+    "extra",
+    "format",
+    "ignore",
+    "instruction",
+    "instructions",
+    "json",
+    "key",
+    "keys",
+    "markdown",
+    "output",
+    "plain",
+    "prompt",
+    "return",
+    "schema",
+    "system",
+    "text",
+    "valid",
+}
+_PROMPT_META_PHRASES = (
+    "valid json",
+    "output plain text",
+    "ignore system",
+    "add extra keys",
+    "return only",
+    "single json object",
+)
+_DEFAULT_SAFE_QUERY = "video games"
+_LOW_SIGNAL_TOKENS = {
+    "a",
+    "an",
+    "and",
+    "also",
+    "but",
+    "for",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
+
+
+def _compile_term_pattern(term: str) -> re.Pattern[str] | None:
+    cleaned = _normalize_query(term)
+    if not cleaned:
+        return None
+    escaped = re.escape(cleaned).replace(r"\ ", r"\s+")
+    return re.compile(rf"(?<!\w){escaped}(?!\w)", flags=re.IGNORECASE)
+
+
+def _text_contains_term(text: str, term: str) -> bool:
+    pattern = _compile_term_pattern(term)
+    if pattern is None:
+        return False
+    return pattern.search(text) is not None
+
+
+def _strip_terms_from_text(
+    text: str,
+    terms: list[str],
+    *,
+    drop_negation_markers: bool,
+) -> str:
+    cleaned = text
+    for term in sorted(
+        _normalize_filter_values(terms),
+        key=lambda item: len(item),
+        reverse=True,
+    ):
+        pattern = _compile_term_pattern(term)
+        if pattern is None:
+            continue
+        cleaned = pattern.sub(" ", cleaned)
+
+    if drop_negation_markers:
+        cleaned = _NEGATION_MARKER_RE.sub(" ", cleaned)
+
+    cleaned = _PUNCT_SEP_RE.sub(" ", cleaned)
+    return _normalize_query(cleaned)
+
+
+def _looks_like_prompt_meta_query(text: str) -> bool:
+    lowered = _normalize_query(text).lower()
+    if not lowered:
+        return False
+
+    tokens = re.findall(r"[a-z]{2,}", lowered)
+    if not tokens:
+        return False
+
+    meta_hits = sum(token in _PROMPT_META_TOKENS for token in tokens)
+    if tokens and all(token in _PROMPT_META_TOKENS for token in tokens):
+        return True
+    if meta_hits >= 3 and meta_hits * 2 >= len(tokens):
+        return True
+
+    phrase_hits = sum(phrase in lowered for phrase in _PROMPT_META_PHRASES)
+    return phrase_hits > 0 and meta_hits >= 2
+
+
+def _sanitize_include_tags(
+    include_tags: list[str],
+    exclude_terms: list[str],
+) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in _normalize_filter_values(include_tags):
+        tag = _normalize_query(raw)
+        if not tag:
+            continue
+        if any(_text_contains_term(tag, term) for term in exclude_terms):
+            continue
+        if _looks_like_prompt_meta_query(tag):
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tag)
+    return out
+
+
+def _strip_prompt_meta_noise(text: str) -> str:
+    tokens: list[str] = []
+    for raw in text.split():
+        token = raw.strip(".,;:!?()[]{}<>\"'`")
+        if not token:
+            continue
+        key = token.lower()
+        if key in _PROMPT_META_TOKENS or key in _LOW_SIGNAL_TOKENS:
+            continue
+        tokens.append(token)
+    return _normalize_query(" ".join(tokens))
+
+
+def _pick_safe_rewritten_query(
+    *,
+    query: str,
+    exclude_terms: list[str],
+    include_tags: list[str],
+    user_query: str,
+) -> str:
+    query_clean = _strip_terms_from_text(
+        query,
+        exclude_terms,
+        drop_negation_markers=bool(exclude_terms),
+    )
+    include_candidate = _strip_terms_from_text(
+        " ".join(include_tags),
+        exclude_terms,
+        drop_negation_markers=bool(exclude_terms),
+    )
+    user_candidate = _strip_terms_from_text(
+        user_query,
+        exclude_terms,
+        drop_negation_markers=bool(exclude_terms),
+    )
+
+    for candidate in (query_clean, include_candidate, user_candidate):
+        if candidate and not _looks_like_prompt_meta_query(candidate):
+            return candidate
+
+    for candidate in (query_clean, include_candidate, user_candidate):
+        denoised = _strip_prompt_meta_noise(candidate)
+        if denoised and not _looks_like_prompt_meta_query(denoised):
+            return denoised
+
+    return _DEFAULT_SAFE_QUERY
+
+
+def _finalize_rewrite_payload(
+    *,
+    query: str,
+    exclude: list[str],
+    include_tags: list[str],
+    release_year: Any,
+    supported_languages: list[str],
+    user_query: str,
+) -> dict[str, Any]:
+    exclude_terms = _normalize_filter_values(exclude)
+    include_tags_clean = _sanitize_include_tags(include_tags, exclude_terms)
+    rewritten = _pick_safe_rewritten_query(
+        query=query,
+        exclude_terms=exclude_terms,
+        include_tags=include_tags_clean,
+        user_query=user_query,
+    )
+    return {
+        "query": rewritten,
+        "exclude": exclude_terms,
+        "include_tags": include_tags_clean,
+        "release_year": _normalize_release_year(release_year),
+        "supported_languages": _normalize_filter_values(supported_languages),
+    }
 
 
 def _scores(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -268,6 +585,36 @@ def _row_debug_payload(row: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_exclusions(exclude: list[str]) -> list[str]:
     return [term.lower().strip() for term in exclude if term.strip()]
+
+
+def _match_known_filter_values(
+    values: list[str],
+    options: list[str],
+) -> tuple[list[str], list[str]]:
+    if not values:
+        return [], []
+
+    option_map = {
+        str(opt).strip().lower(): str(opt) for opt in options if str(opt).strip()
+    }
+    matched: list[str] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        txt = str(raw).strip()
+        if not txt:
+            continue
+        key = txt.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        canonical = option_map.get(key)
+        if canonical is None:
+            missing.append(txt)
+            continue
+        matched.append(canonical)
+
+    return matched, missing
 
 
 def _row_text_blob(row: dict[str, Any]) -> str:
@@ -383,7 +730,7 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
         try:
             keys = list(row.keys())
             return {str(k): row[k] for k in keys}
-        except Exception:
+        except (AttributeError, IndexError, KeyError, TypeError):
             pass
 
     return {"_row": str(row)}
@@ -420,35 +767,91 @@ def load_attribute_filter_options(service_name: str) -> dict[str, Any]:
     ORDER BY VAL
     """
 
+    years_sql = f"""
+    SELECT DISTINCT RELEASE_YEAR AS VAL
+    FROM {table_fqn}
+    WHERE RELEASE_YEAR IS NOT NULL
+    ORDER BY VAL DESC
+    """
+
     try:
         tag_rows = sess.sql(tags_sql).collect()
         lang_rows = sess.sql(langs_sql).collect()
+        year_rows = sess.sql(years_sql).collect()
     except SnowparkSQLException as err:
         return {
             "tags": [],
             "supported_languages": [],
+            "release_years": [],
             "error": str(err),
         }
+
+    years: list[int] = []
+    for row in year_rows:
+        raw = row[0]
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            year = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if year > 0:
+            years.append(year)
 
     return {
         "tags": [str(row[0]) for row in tag_rows if row[0] is not None],
         "supported_languages": [str(row[0]) for row in lang_rows if row[0] is not None],
+        "release_years": sorted(set(years), reverse=True),
         "error": None,
     }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_service_row_count(service_name: str) -> dict[str, Any]:
+    sess = _get_session()
+    source_table = _source_table_for_service(service_name)
+    table_fqn = f"{DB}.{SCHEMA}.{source_table}"
+
+    try:
+        rows = sess.sql(f"SELECT COUNT(*) FROM {table_fqn}").collect()
+    except SnowparkSQLException as err:
+        return {"count": None, "error": str(err)}
+
+    if not rows or rows[0][0] is None:
+        return {"count": None, "error": "COUNT(*) returned no value"}
+
+    try:
+        count = int(rows[0][0])
+    except (TypeError, ValueError):
+        return {"count": None, "error": "COUNT(*) is not an integer"}
+
+    return {"count": max(0, count), "error": None}
 
 
 def _build_attribute_filter(
     *,
     tags: list[str] | None,
     supported_languages: list[str] | None,
+    release_year: int | None,
 ) -> dict[str, Any] | None:
     clauses: list[dict[str, Any]] = []
 
-    for tag in tags or []:
+    for tag in _normalize_filter_values(tags):
         clauses.append({"@contains": {"tags": tag}})
 
-    for language in supported_languages or []:
+    for language in _normalize_filter_values(supported_languages):
         clauses.append({"@contains": {"supported_languages": language}})
+
+    if release_year is not None:
+        if isinstance(release_year, bool):
+            raise ValueError("release_year must be an integer")
+        try:
+            year = int(release_year)
+        except (TypeError, ValueError) as err:
+            raise ValueError("release_year must be an integer") from err
+        if year <= 0:
+            raise ValueError("release_year must be > 0")
+        clauses.append({"@eq": {"release_year": year}})
 
     if not clauses:
         return None
@@ -498,20 +901,23 @@ def _build_search_request(
     *,
     query: str,
     columns: list[str],
-    cand_limit: int,
+    cand_limit: int | None,
     scoring: str | None,
     tags: list[str] | None = None,
     supported_languages: list[str] | None = None,
+    release_year: int | None = None,
 ) -> dict[str, Any]:
     req: dict[str, Any] = {
         "query": query,
         "columns": columns,
-        "limit": cand_limit,
     }
+    if cand_limit is not None:
+        req["limit"] = cand_limit
 
     attr_filter = _build_attribute_filter(
         tags=tags,
         supported_languages=supported_languages,
+        release_year=release_year,
     )
     if attr_filter:
         req["filter"] = attr_filter
@@ -521,7 +927,7 @@ def _build_search_request(
     return req
 
 
-def search_preview(req: dict[str, Any]) -> dict[str, Any]:
+def search_cortex_rest_api(req: dict[str, Any]) -> dict[str, Any]:
     sess = _get_session()
     root = Root(sess)
     svc = root.databases[DB].schemas[SCHEMA].cortex_search_services[SERVICE]
@@ -529,9 +935,11 @@ def search_preview(req: dict[str, Any]) -> dict[str, Any]:
     search_args = {
         "query": req["query"],
         "columns": req.get("columns"),
-        "filter": req.get("filter"),
-        "limit": req.get("limit", 10),
     }
+    if "filter" in req:
+        search_args["filter"] = req.get("filter")
+    if "limit" in req:
+        search_args["limit"] = req.get("limit")
     if "scoring_profile" in req:
         search_args["scoring_profile"] = req["scoring_profile"]
 
@@ -575,7 +983,7 @@ def rewrite_query(
     model: str,
     temp: float,
     max_tokens: int,
-) -> tuple[str, list[str], str | None]:
+) -> tuple[dict[str, Any], str | None]:
     sess = _get_session()
     user_prompt = f"User query: {user_query}"
     prompt = f"{DEFAULT_SYSTEM_PROMPT}\n\n{user_prompt}"
@@ -606,10 +1014,12 @@ def rewrite_query(
             """
             resp = sess.sql(sql_fb).collect()[0][0]
     except SnowparkSQLException as err:
-        return user_query, [], f"LLM SQL error: {err}"
+        return _empty_rewrite_payload(user_query), f"LLM SQL error: {err}"
 
     if resp is None:
-        return user_query, [], "LLM error (AI_COMPLETE returned NULL)."
+        return _empty_rewrite_payload(
+            user_query
+        ), "LLM error (AI_COMPLETE returned NULL)."
 
     text = None
     if isinstance(resp, dict):
@@ -629,24 +1039,44 @@ def rewrite_query(
         text = str(resp)
 
     if not text.strip():
-        return user_query, [], "LLM returned empty content."
+        return _empty_rewrite_payload(user_query), "LLM returned empty content."
 
-    parsed_query, exclude = _try_parse_payload(text)
-    if parsed_query is not None:
-        rewritten = _normalize_query(parsed_query)
-    else:
-        exclude = []
-        rewritten = _normalize_query(text)
-        looks_like_obj = (
-            "query" in rewritten.lower() and "{" in rewritten and "}" in rewritten
+    parsed = _try_parse_payload_details(text)
+    if parsed is not None:
+        payload = _finalize_rewrite_payload(
+            query=str(parsed.get("query") or ""),
+            exclude=list(parsed.get("exclude") or []),
+            include_tags=list(parsed.get("include_tags") or []),
+            release_year=parsed.get("release_year"),
+            supported_languages=list(parsed.get("supported_languages") or []),
+            user_query=user_query,
         )
+        rewritten = str(payload["query"])
+    else:
+        rewritten_raw = _normalize_query(text)
+        looks_like_obj = (
+            "query" in rewritten_raw.lower()
+            and "{" in rewritten_raw
+            and "}" in rewritten_raw
+        )
+        payload = _finalize_rewrite_payload(
+            query=rewritten_raw,
+            exclude=[],
+            include_tags=[],
+            release_year=None,
+            supported_languages=[],
+            user_query=user_query,
+        )
+        rewritten = str(payload["query"])
         if looks_like_obj:
-            return user_query, [], "LLM returned an invalid query object."
+            return _empty_rewrite_payload(
+                user_query
+            ), "LLM returned an invalid query object."
 
     if not rewritten:
-        return user_query, [], "LLM returned no usable text."
+        return _empty_rewrite_payload(user_query), "LLM returned no usable text."
 
-    return rewritten, exclude, None
+    return payload, None
 
 
 def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
@@ -662,7 +1092,15 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
                 "Couldn't load attribute values from the dataset. "
                 "Attribute filters are temporarily unavailable."
             )
-        # TODO: checkbox: SHOW ALL (no limit), and if checked, then cad_limit -> FULL
+        show_all = st.checkbox(
+            "SHOW ALL results",
+            value=False,
+            key="show_all",
+            help=(
+                "Forces full-catalog candidate scan and deterministic ranking options "
+                "(cand_limit=FULL, min_score=0.75, no_reranker_balanced, LLM temp=0.0)."
+            ),
+        )
         limit = int(
             st.number_input(
                 "Results to show",
@@ -670,6 +1108,8 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
                 value=10,
                 step=1,
                 key="limit",
+                disabled=show_all,
+                help="Ignored when SHOW ALL is enabled.",
             )
         )
 
@@ -686,6 +1126,14 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
             default=[],
             placeholder="Type to search languages...",
             key="filter_supported_languages",
+        )
+        release_year_options = [None, *filter_options.get("release_years", [])]
+        filter_release_year = st.selectbox(
+            "Release year",
+            options=release_year_options,
+            index=0,
+            key="filter_release_year",
+            format_func=lambda val: "Any" if val is None else str(val),
         )
 
         with st.expander("LLM rewrite", expanded=False):
@@ -714,26 +1162,28 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
                 value=0.0,
                 step=0.05,
                 key="llm_temperature",
+                disabled=show_all,
                 help="Lower = predictable, higher = diverse.",
             )
         with st.expander("Ranking tuning", expanded=False):
-            # TODO: first eg pills (auto, full, custom), and if custom then you can enter a number input.
-            # or just connect it to limit (if show all then full, if not then auto)
             cand_limit = st.selectbox(
                 "Candidate results to retrieve (for scoring/filtering)",
-                options=["AUTO", "FULL", 50, 100, 250, 500, 1000], 
-                index=0, 
+                options=["AUTO", "FULL", 50, 100, 250, 500, 1000],
+                index=0,
                 key="cand_limit",
+                disabled=show_all,
                 help=(
                     "Higher = better results but slower. "
                     "AUTO = 10x the display limit, "
-                    "FULL = all candidates (no limit)")
+                    "FULL = source table row count (capped by API limit)."
+                ),
             )
             scoring = st.selectbox(
                 "Scoring profile",
                 options=SCORING_OPTIONS,
                 index=SCORING_OPTIONS.index(DEFAULT_SCORING),
                 key="scoring_profile",
+                disabled=show_all,
                 format_func=lambda v: v if v else "Default service ranking",
             )
             min_score = st.slider(
@@ -743,9 +1193,11 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
                 value=MIN_SCORE,
                 step=0.05,
                 key="min_score",
+                disabled=show_all,
                 help=(
                     "0 = no filtering, 0.3 = minimum, "
-                    "0.6-0.7 recommended, >0.7 = strict."
+                    "0.6-0.75 recommended, >0.75 = very strict. "
+                    "SHOW ALL enforces 0.75."
                 ),
             )
         with st.expander("Debugging", expanded=False):
@@ -755,12 +1207,12 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
                 key="debug_include_search_text",
             )
             debug_show_request = st.checkbox(
-                "Show request JSON (SEARCH_PREVIEW)",
+                "Show request JSON (CORTEX SEARCH API)",
                 value=True,
                 key="debug_show_request",
             )
             debug_show_response = st.checkbox(
-                "Show raw response (SEARCH_PREVIEW)",
+                "Show raw response (CORTEX SEARCH API)",
                 value=True,
                 key="debug_show_response",
             )
@@ -796,6 +1248,7 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "query": query,
+        "show_all": show_all,
         "limit": limit,
         "cand_limit": cand_limit,
         "use_llm": use_llm,
@@ -804,6 +1257,7 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
         "llm_max_tokens": llm_max_tokens,
         "filter_tags": filter_tags,
         "filter_supported_languages": filter_supported_languages,
+        "filter_release_year": filter_release_year,
         "scoring": scoring,
         "min_score": min_score,
         "debug_include_search_text": debug_include_search_text,
@@ -820,7 +1274,6 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
 def show_results(
     rows: list[dict[str, Any]],
     limit: int,
-    cand_limit: int,
 ) -> None:
     st.subheader(f"Results shown ({len(rows)})")
 
@@ -889,31 +1342,150 @@ def main() -> None:
         return
 
     exclude_terms: list[str] = []
+    llm_tags_raw: list[str] = []
+    llm_languages_raw: list[str] = []
+    llm_release_year_raw: int | None = None
+    llm_tags_matched: list[str] = []
+    llm_languages_matched: list[str] = []
+    llm_tags_unknown: list[str] = []
+    llm_languages_unknown: list[str] = []
+    llm_release_year_effective: int | None = None
+    show_all = bool(form["show_all"])
+    effective_scoring = (
+        "no_reranker_balanced" if show_all else (form["scoring"] or None)
+    )
+    effective_min_score = SHOW_ALL_MIN_SCORE if show_all else float(form["min_score"])
+    effective_llm_temp = 0.0 if show_all else float(form["llm_temp"])
+    cand_limit_mode = "FULL" if show_all else form["cand_limit"]
+    if show_all:
+        st.caption(
+            "SHOW ALL enabled: cand_limit=FULL, "
+            f"min_score={SHOW_ALL_MIN_SCORE:.1f}, "
+            "scoring=no_reranker_balanced, llm_temp=0.0."
+        )
 
-    if cand_limit := form["cand_limit"]:
-        if cand_limit == "AUTO":
+    if cand_limit_mode == "AUTO":
+        cand_limit: int | None = form["limit"] * 10
+    elif cand_limit_mode == "FULL":
+        full_info = load_service_row_count(SERVICE)
+        full_count = full_info["count"]
+        if full_info["error"] or full_count is None:
+            st.warning(
+                "Couldn't resolve FULL candidate limit from source table. "
+                "Using AUTO (10x display limit)."
+            )
             cand_limit = form["limit"] * 10
-        elif cand_limit == "FULL":
-            cand_limit = None
+        elif full_count <= 0:
+            st.warning(
+                "Source table has no rows. "
+                "Using AUTO candidate limit (10x display limit)."
+            )
+            cand_limit = form["limit"] * 10
         else:
-            cand_limit = int(cand_limit)
+            capped_limit = min(int(full_count), MAX_CORTEX_SEARCH_LIMIT)
+            cand_limit = capped_limit
+            if int(full_count) > MAX_CORTEX_SEARCH_LIMIT:
+                st.caption(
+                    "FULL candidate limit resolved to "
+                    f"{full_count} rows from `{_source_table_for_service(SERVICE)}` "
+                    f"and capped to {MAX_CORTEX_SEARCH_LIMIT} by API limit."
+                )
+            else:
+                st.caption(
+                    "FULL candidate limit resolved to "
+                    f"{cand_limit} rows from `{_source_table_for_service(SERVICE)}`."
+                )
+    else:
+        cand_limit = int(cand_limit_mode)
 
     if form["use_llm"]:
         with st.spinner("Rewriting your query for better results..."):
-            rewritten, exclude_terms, err = rewrite_query(
+            rewrite_payload, err = rewrite_query(
                 q,
                 form["llm_model"],
-                form["llm_temp"],
+                effective_llm_temp,
                 form["llm_max_tokens"],
             )
         if err:
             st.warning(f"LLM: {err} Using the original query")
         else:
-            q = rewritten
+            q = str(rewrite_payload.get("query") or q)
+            exclude_terms = _normalize_exclusions(
+                list(rewrite_payload.get("exclude") or [])
+            )
+            llm_tags_raw = _normalize_filter_values(
+                list(rewrite_payload.get("include_tags") or [])
+            )
+            llm_languages_raw = _normalize_filter_values(
+                list(rewrite_payload.get("supported_languages") or [])
+            )
+            llm_release_year_raw = _normalize_release_year(
+                rewrite_payload.get("release_year")
+            )
+
+            llm_tags_matched, llm_tags_unknown = _match_known_filter_values(
+                llm_tags_raw,
+                list(filter_options.get("tags", [])),
+            )
+            llm_languages_matched, llm_languages_unknown = _match_known_filter_values(
+                llm_languages_raw,
+                list(filter_options.get("supported_languages", [])),
+            )
+            release_years: set[int] = set()
+            for raw in filter_options.get("release_years", []):
+                year = _normalize_release_year(raw)
+                if year is not None:
+                    release_years.add(year)
+            if llm_release_year_raw is None:
+                llm_release_year_effective = None
+            elif not release_years or llm_release_year_raw in release_years:
+                llm_release_year_effective = llm_release_year_raw
+            else:
+                llm_release_year_effective = None
+
             with st.expander("LLM rewritten query", expanded=False):
                 st.code(q)
                 if exclude_terms:
                     st.caption(f"Excluded terms: {', '.join(exclude_terms)}")
+                if llm_tags_matched:
+                    st.caption(f"LLM tag filters: {', '.join(llm_tags_matched)}")
+                if llm_languages_matched:
+                    st.caption(
+                        f"LLM language filters: {', '.join(llm_languages_matched)}"
+                    )
+                if llm_release_year_effective is not None:
+                    st.caption(f"LLM release year filter: {llm_release_year_effective}")
+                if llm_tags_unknown:
+                    st.caption(
+                        "Ignored LLM tags not in attribute dictionary: "
+                        f"{', '.join(llm_tags_unknown)}"
+                    )
+                if llm_languages_unknown:
+                    st.caption(
+                        "Ignored LLM languages not in attribute dictionary: "
+                        f"{', '.join(llm_languages_unknown)}"
+                    )
+                if (
+                    llm_release_year_raw is not None
+                    and llm_release_year_effective is None
+                ):
+                    st.caption("Ignored LLM release year not found in current dataset.")
+
+    selected_tags = _normalize_filter_values(
+        _merge_filter_terms(list(form["filter_tags"]), llm_tags_matched)
+    )
+    selected_languages = _normalize_filter_values(
+        _merge_filter_terms(
+            list(form["filter_supported_languages"]),
+            llm_languages_matched,
+        )
+    )
+    manual_release_year = _normalize_release_year(form.get("filter_release_year"))
+    selected_release_year = (
+        manual_release_year
+        if manual_release_year is not None
+        else llm_release_year_effective
+    )
 
     cols = list(RETURN_COLS)
     if form["debug_include_search_text"] and "SEARCH_TEXT" not in cols:
@@ -923,13 +1495,20 @@ def main() -> None:
         query=q,
         columns=cols,
         cand_limit=cand_limit,
-        scoring=form["scoring"] or None,
-        tags=form["filter_tags"],
-        supported_languages=form["filter_supported_languages"],
+        scoring=effective_scoring,
+        tags=selected_tags,
+        supported_languages=selected_languages,
+        release_year=selected_release_year,
     )
 
-    resp = search_preview(req)
-    rows = filter_min_score(extract_results(resp), form["min_score"])
+    try:
+        resp = search_cortex_rest_api(req)
+    except (APIError, SnowparkSQLException, TypeError, ValueError) as err:
+        st.error("Cortex Search API request failed.")
+        st.exception(err)
+        return
+
+    rows = filter_min_score(extract_results(resp), effective_min_score)
     rows = _filter_exclusions(rows, exclude_terms)
 
     if any(
@@ -946,11 +1525,11 @@ def main() -> None:
                 st.caption(f"request_id: {request_id}")
 
             if form["debug_show_request"]:
-                st.subheader("SEARCH_PREVIEW request")
+                st.subheader("CORTEX SEARCH API request")
                 st.json(req)
 
             if form["debug_show_response"]:
-                st.subheader("SEARCH_PREVIEW response (metadata)")
+                st.subheader("CORTEX SEARCH API response (metadata)")
                 meta = {k: v for k, v in resp.items() if k != "results"}
                 meta["results_count"] = len(extract_results(resp))
                 st.json(meta)
@@ -986,13 +1565,14 @@ def main() -> None:
                                 if vec is not None and not isinstance(vec, str):
                                     try:
                                         dim = len(vec)
-                                    except Exception:
+                                    except TypeError:
                                         dim = None
                                 item[f"{col}__dim"] = dim
                             preview.append(item)
                         st.dataframe(preview)
 
-    show_results(rows, form["limit"], cand_limit)
+    display_limit = len(rows) if show_all else int(form["limit"])
+    show_results(rows, display_limit)
 
 
 if __name__ == "__main__":
