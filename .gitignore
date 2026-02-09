@@ -19,6 +19,7 @@ snowflake_private_key*.p8
 
 # python bytecode, caches, tests, coverage
 __pycache__/
+.pycache
 *.py[cod]
 *.pyo
 *.pyd
@@ -39,6 +40,7 @@ htmlcov/
 .pytype/
 dmypy.json
 .streamlit/.cache/
+.uv-cache
 
 # build / packaging artifacts
 build/

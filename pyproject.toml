@@ -21,6 +21,13 @@ dev = [
   "ty",
 ]
 
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.ruff]
 target-version = "py314"
 line-length = 88
@@ -42,3 +49,4 @@ python_files = ["test_*.py"]
 markers = [
   "functional: tests hitting real Cortex Search/Snowflake",
 ]
+
