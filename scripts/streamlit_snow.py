@@ -1,10 +1,13 @@
 import ast
 import json
+import sys
+from pathlib import Path
 from typing import Any
 
 import streamlit as st
 from snowflake.snowpark.context import get_active_session
 from snowflake.snowpark.exceptions import SnowparkSQLException
+from snowflake.core import Root
 
 # DEFAULTS CONFIGURATION
 
@@ -33,18 +36,50 @@ MAX_DEBUG_SCAN_ROWS = 50
 DEFAULT_LLM_MAX_TOKENS = 120
 
 DEFAULT_SYSTEM_PROMPT = """
-You rewrite user queries for semantic search over a video games catalog.
-Return ONLY a JSON object with two keys: "query" and "exclude".
-- "query" is the rewritten search query (English, keyword-rich).
-- "exclude" is a list of keywords/tags that the user explicitly excludes
-  (based on negations like "no", "without", "not", "exclude", "avoid").
-Preserve user-provided tags/keywords (do not drop them).
-If the query is already good, return it unchanged.
-If you cannot improve it, return the original user query unchanged.
-Do NOT invent game titles. Focus on genres, mechanics, themes, and features.
-Example: {"query": "battle royale building survival shooting multiplayer",
-          "exclude": []}
-Example: {"query": "co-op sci-fi shooter space aliens", "exclude": ["cats"]}
+You rewrite user queries for hybrid (keyword + vector) search over a video games catalog.
+
+Return ONLY a valid JSON object with exactly two keys: "query" and "exclude".
+
+Hard requirements:
+- Output MUST be valid JSON (double quotes, no trailing commas).
+- Output MUST be a single JSON object and nothing else.
+- Output MUST be a single line.
+- Do NOT wrap the JSON in markdown fences/backticks and do NOT add explanations.
+- Always include both keys:
+  - "query": a string
+  - "exclude": an array of strings (use [] if there are no exclusions)
+- Do NOT return JSON as a string (no extra quotes around the whole object).
+- Do NOT add any additional keys.
+
+Input format:
+- The user query will appear as a line starting with: User query:
+- Use only that text as the input query to rewrite.
+
+Rewrite rules:
+- "query" must be short, English, keyword-rich, suitable for hybrid (keyword + vector) search.
+- Prefer 5–20 keywords / short phrases, not full sentences (less noise for embeddings).
+- Preserve user-provided keywords/tags (do not drop them).
+- Preserve concrete mechanic/mode/tag terms literally (helps keyword stage).
+- Add synonyms only when needed; avoid over-expansion that makes the query too generic.
+- Do NOT invent game titles. Focus on genres, mechanics, themes, and features.
+- If the query is already good, return it unchanged (normalize whitespace only).
+
+Exclusions:
+- If the user explicitly excludes something via negation (no/without/not/avoid/exclude),
+  add that term to "exclude".
+- "exclude" items should be simple keywords/tags, lowercase, no punctuation.
+- Exclusions have priority over the main query. If a term is in "exclude", it should not appear in "query".
+- If there are no exclusions, return "exclude": [].
+
+Examples:
+Input: User query: co-op multiplayer games set in Japan without cats
+Output: {"query":"co-op multiplayer Japan","exclude":["cats"]}
+
+Input: User query: battle royale with building, looting resources, and combat
+Output: {"query":"battle royale building looting combat","exclude":[]}
+
+Input: User query: puzzle game not horror, no gore
+Output: {"query":"puzzle","exclude":["horror","gore"]}
 """.strip()
 
 LLM_MODELS = [
@@ -65,6 +100,22 @@ DEFAULT_SCORING = "balanced_default"
 
 
 # HELPER FUNCTIONS
+
+
+@st.cache_resource
+def _get_local_session():
+    src_path = Path(__file__).resolve().parents[1] / "src"
+    if str(src_path) not in sys.path:
+        sys.path.append(str(src_path))
+    from cortex_search_games.utils.snowflake_conn import get_session
+    return get_session("cortex")
+
+
+def _get_session():
+    try:
+        return get_active_session()
+    except Exception:
+        return _get_local_session()
 
 
 def _escape_sql(val: str) -> str:
@@ -303,7 +354,7 @@ def _row_score(row: dict[str, Any]) -> float | None:
 
 
 def ensure_service_exists() -> None:
-    sess = get_active_session()
+    sess = _get_session()
     try:
         sess.sql(f"DESC CORTEX SEARCH SERVICE {SERVICE_FQN}").collect()
     except SnowparkSQLException as err:
@@ -346,7 +397,7 @@ def _source_table_for_service(service_name: str) -> str:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_attribute_filter_options(service_name: str) -> dict[str, Any]:
-    sess = get_active_session()
+    sess = _get_session()
     source_table = _source_table_for_service(service_name)
     table_fqn = f"{DB}.{SCHEMA}.{source_table}"
 
@@ -406,7 +457,7 @@ def _build_attribute_filter(
 
 
 def describe_service() -> list[dict[str, Any]]:
-    sess = get_active_session()
+    sess = _get_session()
     try:
         rows = sess.sql(f"DESC CORTEX SEARCH SERVICE {SERVICE_FQN}").collect()
     except SnowparkSQLException as err:
@@ -416,7 +467,7 @@ def describe_service() -> list[dict[str, Any]]:
 
 
 def cortex_search_data_scan(limit: int) -> list[dict[str, Any]]:
-    sess = get_active_session()
+    sess = _get_session()
     n = max(1, min(int(limit), MAX_DEBUG_SCAN_ROWS))
     svc = _escape_sql(SERVICE_FQN)
 
@@ -470,22 +521,21 @@ def _build_search_request(
 
 
 def search_preview(req: dict[str, Any]) -> dict[str, Any]:
-    sess = get_active_session()
+    sess = _get_session()
+    root = Root(sess)
+    svc = root.databases[DB].schemas[SCHEMA].cortex_search_services[SERVICE]
 
-    req_json = _escape_sql(json.dumps(req, ensure_ascii=False))
+    search_args = {
+        "query": req["query"],
+        "columns": req.get("columns"),
+        "filter": req.get("filter"),
+        "limit": req.get("limit", 10),
+    }
+    if "scoring_profile" in req:
+        search_args["scoring_profile"] = req["scoring_profile"]
 
-    sql = f"""
-    SELECT PARSE_JSON(
-        SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
-            '{SERVICE_FQN}',
-            '{req_json}'
-        )
-    ) AS RESP
-    """
-
-    raw = sess.sql(sql).collect()[0][0]
-    parsed = json.loads(raw) if isinstance(raw, str) else raw
-    return parsed if isinstance(parsed, dict) else {}
+    resp = svc.search(**search_args)
+    return {"results": resp.results, "request_id": resp.request_id}
 
 
 def extract_results(resp: dict[str, Any]) -> list[dict[str, Any]]:
@@ -525,7 +575,7 @@ def rewrite_query(
     temp: float,
     max_tokens: int,
 ) -> tuple[str, list[str], str | None]:
-    sess = get_active_session()
+    sess = _get_session()
     user_prompt = f"User query: {user_query}"
     prompt = f"{DEFAULT_SYSTEM_PROMPT}\n\n{user_prompt}"
 
