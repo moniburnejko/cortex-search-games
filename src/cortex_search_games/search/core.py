@@ -3,9 +3,9 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
-from snowflake.connector import SnowflakeConnection
-from snowflake.connector.errors import Error as SnowflakeError
-from snowflake.connector.errors import ProgrammingError
+from snowflake.core import Root
+from snowflake.snowpark import Session
+from snowflake.snowpark.exceptions import SnowparkSQLException
 
 
 def strip_code_fences(text: str) -> str:
@@ -292,73 +292,31 @@ def _build_attribute_filter(
     return {"@and": clauses}
 
 
-def _build_search_payload(
-    *,
-    query: str,
-    cols: Sequence[str],
-    limit: int,
-    profile: str | None,
-    tags: Sequence[str] | None = None,
-    genres: Sequence[str] | None = None,
-    release_year: int | None = None,
-    supported_languages: Sequence[str] | None = None,
-) -> str:
-    if not query.strip():
-        raise ValueError("query cannot be empty")
-    if limit <= 0:
-        raise ValueError("limit must be > 0")
-
-    cols_list = [col.strip() for col in cols if isinstance(col, str) and col.strip()]
-    if not cols_list:
-        raise ValueError("columns cannot be empty")
-
-    req: dict[str, Any] = {
-        "query": query,
-        "columns": cols_list,
-        "limit": limit,
-    }
-
-    attr_filter = _build_attribute_filter(
-        tags=tags,
-        genres=genres,
-        release_year=release_year,
-        supported_languages=supported_languages,
-    )
-    if attr_filter:
-        req["filter"] = attr_filter
-
-    if profile:
-        req["scoring_profile"] = profile
-
-    return json.dumps(req, ensure_ascii=False)
-
-
 def _fetch_single_value(
-    conn: SnowflakeConnection,
+    session: Session,
     sql: str,
     params: Sequence[Any] = (),
 ) -> Any:
-    with conn.cursor() as cur:
-        cur.execute(sql, tuple(params))
-        row = cur.fetchone()
+    try:
+        rows = session.sql(sql, params=params).collect()
+    except SnowparkSQLException as err:
+        raise RuntimeError(f"Snowflake query failed: {err}") from err
 
-    if row is None:
+    if not rows:
         raise RuntimeError("Snowflake query returned no rows.")
 
-    return row[0]
+    return rows[0][0]
 
 
-def ensure_service_exists(conn: SnowflakeConnection, svc: str) -> None:
+def ensure_service_exists(session: Session, svc: str) -> None:
     try:
-        with conn.cursor() as cur:
-            cur.execute(f"DESC CORTEX SEARCH SERVICE {svc}")
-            cur.fetchone()
-    except ProgrammingError as err:
+        session.sql(f"DESC CORTEX SEARCH SERVICE {svc}").collect()
+    except SnowparkSQLException as err:
         raise RuntimeError(f"Can't describe Cortex Search Service: {svc}.") from err
 
 
 def rewrite_query_with_llm(
-    conn: SnowflakeConnection,
+    session: Session,
     *,
     user_query: str,
     model: str,
@@ -374,15 +332,15 @@ def rewrite_query_with_llm(
 
     sql = """
     SELECT AI_COMPLETE(
-        %s,
-        %s,
-        PARSE_JSON(%s)
+        ?,
+        ?,
+        PARSE_JSON(?)
     ) AS RESPONSE
     """
 
     try:
-        resp = _fetch_single_value(conn, sql, (model, prompt, opts_json))
-    except (SnowflakeError, RuntimeError) as err:
+        resp = _fetch_single_value(session, sql, (model, prompt, opts_json))
+    except (SnowparkSQLException, RuntimeError) as err:
         return user_query, [], f"LLM SQL error: {err}"
 
     if resp is None:
@@ -427,7 +385,7 @@ def rewrite_query_with_llm(
 
 
 def query_cortex_search_service(
-    conn: SnowflakeConnection,
+    session: Session,
     *,
     service_fqn: str,
     query: str,
@@ -440,39 +398,51 @@ def query_cortex_search_service(
     release_year: int | None = None,
     supported_languages: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    req_json = _build_search_payload(
-        query=query,
-        cols=columns,
-        limit=candidate_limit,
-        profile=scoring_profile,
+    if not query.strip():
+        raise ValueError("query cannot be empty")
+    if candidate_limit <= 0:
+        raise ValueError("limit must be > 0")
+
+    cols_list = [col.strip() for col in columns if isinstance(col, str) and col.strip()]
+    if not cols_list:
+        raise ValueError("columns cannot be empty")
+
+    parts = service_fqn.split(".")
+    if len(parts) != 3:
+        raise ValueError("Service FQN must be 'DB.SCHEMA.SERVICE'")
+    db_name, schema_name, svc_name = parts
+
+    root = Root(session)
+    svc = root.databases[db_name].schemas[schema_name].cortex_search_services[svc_name]
+
+    search_args = {
+        "query": query,
+        "columns": cols_list,
+        "limit": candidate_limit,
+    }
+
+    attr_filter = _build_attribute_filter(
         tags=tags,
         genres=genres,
         release_year=release_year,
         supported_languages=supported_languages,
     )
+    if attr_filter:
+        search_args["filter"] = attr_filter
 
-    sql = """
-    SELECT PARSE_JSON(
-        SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
-            %s,
-            %s
-        )
-    )['results'] AS RESULTS
-    """
+    if scoring_profile:
+        search_args["scoring_profile"] = scoring_profile
 
     try:
-        raw = _fetch_single_value(conn, sql, (service_fqn, req_json))
-    except (SnowflakeError, RuntimeError) as err:
-        raise RuntimeError(f"Cortex search failed for service {service_fqn}.") from err
+        resp = svc.search(**search_args)
+    except Exception as err:
+        raise RuntimeError(f"Cortex search failed for service {service_fqn}: {err}") from err
 
-    rows_raw: Any = raw
-    if isinstance(raw, str):
-        rows_raw = json.loads(raw)
-
-    if not isinstance(rows_raw, list):
-        raise RuntimeError("Cortex search returned unexpected result shape.")
-
-    rows = [row for row in rows_raw if isinstance(row, dict)]
+    rows = resp.results
+    # Ensure rows is a list of dicts
+    if not isinstance(rows, list):
+        rows = []
+    rows = [row for row in rows if isinstance(row, dict)]
 
     if min_score is not None and min_score > 0:
         scores = [row_score(row) for row in rows]

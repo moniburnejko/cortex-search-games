@@ -2,14 +2,13 @@ import csv
 import json
 import sys
 import time
-from contextlib import closing
 from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from snowflake.connector import SnowflakeConnection
+from snowflake.snowpark import Session
 
 from cortex_search_games.search.core import (
     ensure_service_exists,
@@ -21,7 +20,7 @@ from cortex_search_games.search.core import (
     rewrite_query_with_llm,
     row_score,
 )
-from cortex_search_games.utils.snowflake_conn import get_connection
+from cortex_search_games.utils.snowflake_conn import get_session
 
 # DEFAULTS CONFIGURATION
 
@@ -51,7 +50,9 @@ LLM_MODELS = (
 )
 TEMPS = (0.0, 0.6)
 USE_LLM = (False, True)
-QUERIES = ("battle royale without cats",)
+QUERIES = (
+    "neon cybercity cat adventure with a drone companion, stealthy exploration, mysterious robots",
+)
 
 SERVICE = "CORTEX_DB.RAW.CAT_GAMES_SVC_1_5"
 LIMIT = 10
@@ -78,17 +79,20 @@ LLM_MAX_TOKENS = 120
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 OUTPUT_DIR = PROJECT_ROOT / "output"
-OUTPUT_FILE = "batch_test_cat.json"
+OUTPUT_FILE = "test_drift_1_5"
 
 CONN_NAME = "cortex"
 CONN_TOML: Path | None = None
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "DEBUG"
+# Set to False when using Python API as it doesn't generate SQL query history
+# accessible via LAST_QUERY_ID in the same session context.
+COLLECT_SQL_METRICS = False
 
 
 QUERY_HISTORY_SQL = """
 SELECT OBJECT_CONSTRUCT(*) AS QUERY_HISTORY
 FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(RESULT_LIMIT => 200))
-WHERE QUERY_ID = %s
+WHERE QUERY_ID = ?
 ORDER BY START_TIME DESC
 LIMIT 1
 """
@@ -217,11 +221,11 @@ def _extract_query_history_metrics(
     }
 
 
-def _last_query_id(conn: SnowflakeConnection) -> str:
+def _last_query_id(session: Session) -> str:
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT LAST_QUERY_ID()")
-            row = cur.fetchone()
+        # Snowpark execution
+        rows = session.sql("SELECT LAST_QUERY_ID()").collect()
+        row = rows[0] if rows else None
     except Exception as err:
         logger.debug("Couldn't fetch LAST_QUERY_ID(): {}", err)
         return ""
@@ -232,7 +236,7 @@ def _last_query_id(conn: SnowflakeConnection) -> str:
 
 
 def _query_history_metrics(
-    conn: SnowflakeConnection,
+    session: Session,
     query_id: str,
     *,
     attempts: int = 3,
@@ -243,9 +247,8 @@ def _query_history_metrics(
 
     for attempt in range(attempts):
         try:
-            with conn.cursor() as cur:
-                cur.execute(QUERY_HISTORY_SQL, (query_id,))
-                row = cur.fetchone()
+            rows = session.sql(QUERY_HISTORY_SQL, params=[query_id]).collect()
+            row = rows[0] if rows else None
         except Exception as err:
             logger.debug("QUERY_HISTORY_BY_SESSION failed for {}: {}", query_id, err)
             return _empty_query_history_metrics(query_id)
@@ -418,8 +421,8 @@ def run_batch(
         max_cand,
     )
 
-    with closing(get_connection(conn_name, conn_toml)) as conn:
-        ensure_service_exists(conn, svc)
+    with get_session(conn_name, conn_toml) as session:
+        ensure_service_exists(session, svc)
 
         cand_limit = resolve_candidate_limit(
             limit=limit,
@@ -447,26 +450,34 @@ def run_batch(
                 rew_ms = 0
                 rewrite_query_id = ""
                 rewrite_history = _empty_query_history_metrics("")
+                search_query_id = ""
+                search_history = _empty_query_history_metrics("")
 
                 exclude_terms: list[str] = []
                 if cfg["use_llm"]:
                     t0 = time.perf_counter()
-                    rew_q, exclude_terms, err = rewrite_query_with_llm(
-                        conn,
-                        user_query=q,
-                        model=cfg["model"] or "",
-                        temperature=cfg["temp"] or 0.0,
-                        max_tokens=llm_max_tokens,
-                        system_prompt=sys_prompt,
-                    )
+                    try:
+                        rew_q, exclude_terms, err = rewrite_query_with_llm(
+                            session,
+                            user_query=q,
+                            model=cfg["model"] or "",
+                            temperature=cfg["temp"] or 0.0,
+                            max_tokens=llm_max_tokens,
+                            system_prompt=sys_prompt,
+                        )
+                    except Exception as e:
+                        logger.error(f"LLM Rewrite failed for query '{q}': {e}")
+                        rew_q, exclude_terms, err = q, [], str(e)
+
                     rew_ms = round((time.perf_counter() - t0) * 1000)
                     rew_err = err or ""
-                    rewrite_query_id = _last_query_id(conn)
-                    rewrite_history = _query_history_metrics(conn, rewrite_query_id)
+                    if COLLECT_SQL_METRICS:
+                        rewrite_query_id = _last_query_id(session)
+                        rewrite_history = _query_history_metrics(session, rewrite_query_id)
 
                 t1 = time.perf_counter()
                 results = query_cortex_search_service(
-                    conn,
+                    session,
                     service_fqn=svc,
                     query=rew_q,
                     columns=cols,
@@ -474,10 +485,15 @@ def run_batch(
                     scoring_profile=cfg["profile"],
                     min_score=cfg["min_score"],
                 )
+                # Ensure results is a list (API might return an iterator/generator)
+                if not isinstance(results, list):
+                    results = list(results)
+
                 results = filter_exclusions(results, exclude_terms)
                 search_ms = round((time.perf_counter() - t1) * 1000)
-                search_query_id = _last_query_id(conn)
-                search_history = _query_history_metrics(conn, search_query_id)
+                if COLLECT_SQL_METRICS:
+                    search_query_id = _last_query_id(session)
+                    search_history = _query_history_metrics(session, search_query_id)
 
                 ts = datetime.now(UTC).isoformat(timespec="seconds")
                 request_cost_credits = _sum_optional_floats(
