@@ -36,6 +36,22 @@ def _normalize_text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
 
 
+def _normalize_query_lookup_key(value: Any) -> str:
+    text = _normalize_text(value).lower()
+    if not text:
+        return ""
+
+    text = (
+        text.replace("—", "-")
+        .replace("–", "-")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("’", "'")
+    )
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return " ".join(text.split()).strip()
+
+
 def _parse_list_field(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
@@ -81,13 +97,25 @@ def _extract_query_sets(markdown_text: str) -> dict[str, list[str]]:
     in_code_block = False
     code_lines: list[str] = []
 
-    for line in markdown_text.splitlines():
-        heading_match = re.match(r"^\s*\d+\.\s*(.+?)\s*$", line)
-        if heading_match and not in_code_block:
-            current_heading = heading_match.group(1).strip()
-            continue
+    def _append_query_mapping(query: str, heading: str) -> None:
+        normalized_exact = _normalize_text(query).lower()
+        normalized_lookup = _normalize_query_lookup_key(query)
+        for key in (normalized_exact, normalized_lookup):
+            if not key:
+                continue
+            mapped = query_sets.setdefault(key, [])
+            if heading not in mapped:
+                mapped.append(heading)
 
+    for line in markdown_text.splitlines():
         stripped = line.strip()
+        if not in_code_block and stripped:
+            heading_match = re.match(r"^\s*(?:#+\s*|\d+\.\s*)(.+?)\s*$", stripped)
+            if heading_match:
+                current_heading = heading_match.group(1).strip()
+            elif not stripped.startswith("```"):
+                current_heading = stripped
+
         if stripped.startswith("```"):
             if not in_code_block:
                 in_code_block = True
@@ -100,10 +128,9 @@ def _extract_query_sets(markdown_text: str) -> dict[str, list[str]]:
 
             queries = _parse_query_tuple("\n".join(code_lines))
             for query in queries:
-                normalized = _normalize_text(query).lower()
-                if not normalized:
+                if not _normalize_text(query):
                     continue
-                query_sets.setdefault(normalized, []).append(current_heading)
+                _append_query_mapping(query, current_heading)
             continue
 
         if in_code_block:
@@ -231,13 +258,27 @@ def _prepare_requests(
         "search_ms",
         "request_ms",
         "request_total_elapsed_ms",
+        "rewrite_cost_total_credits",
+        "search_cost_total_credits",
         "request_cost_total_credits",
+        "rewrite_cost_cloud_services_credits",
+        "search_cost_cloud_services_credits",
+        "rewrite_cost_compute_credits",
+        "search_cost_compute_credits",
+        "rewrite_cost_query_accel_credits",
+        "search_cost_query_accel_credits",
         "result_count",
         "result_count_after_limit",
     ]
     for col in numeric_cols:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    for col in ("rewrite_query_id", "search_query_id"):
+        if col in out.columns:
+            out[col] = out[col].fillna("").astype(str).str.strip()
+        else:
+            out[col] = ""
 
     if "timestamp_utc" in out.columns:
         out["timestamp_utc"] = pd.to_datetime(
@@ -269,10 +310,16 @@ def _prepare_requests(
         out["temperature_label"] = "(none)"
 
     if "original_query" in out.columns:
-        normalized = out["original_query"].fillna("").map(_normalize_text).str.lower()
-        out["query_sets"] = normalized.map(
-            lambda query: query_set_mapping.get(query, [])
+        normalized_exact = (
+            out["original_query"].fillna("").map(_normalize_text).str.lower()
         )
+        normalized_lookup = out["original_query"].fillna("").map(
+            _normalize_query_lookup_key
+        )
+        out["query_sets"] = [
+            query_set_mapping.get(exact, query_set_mapping.get(lookup, []))
+            for exact, lookup in zip(normalized_exact, normalized_lookup, strict=False)
+        ]
         out["query_set_primary"] = out["query_sets"].map(_primary_query_set)
         out["query_set_all"] = out["query_sets"].map(", ".join)
     else:
@@ -366,18 +413,19 @@ def _config_summary(df: pd.DataFrame) -> pd.DataFrame:
     ]
     group_cols = [col for col in group_cols if col in df.columns]
 
-    summary = (
-        df.groupby(group_cols, dropna=False)
-        .agg(
-            requests=("request_key", "nunique"),
-            avg_request_ms=("request_ms", "mean"),
-            avg_search_ms=("search_ms", "mean"),
-            avg_results_after_limit=("result_count_after_limit", "mean"),
-            avg_cost_credits=("request_cost_total_credits", "mean"),
-            rewrite_error_rate=("rewrite_error_flag", "mean"),
-        )
-        .reset_index()
-    )
+    agg_spec: dict[str, tuple[str, str]] = {
+        "requests": ("request_key", "nunique"),
+        "avg_request_ms": ("request_ms", "mean"),
+        "avg_search_ms": ("search_ms", "mean"),
+        "avg_results_after_limit": ("result_count_after_limit", "mean"),
+        "rewrite_error_rate": ("rewrite_error_flag", "mean"),
+    }
+    if "request_cost_total_credits" in df.columns:
+        agg_spec["avg_cost_credits"] = ("request_cost_total_credits", "mean")
+
+    summary = df.groupby(group_cols, dropna=False).agg(**agg_spec).reset_index()
+    if "avg_cost_credits" not in summary.columns:
+        summary["avg_cost_credits"] = pd.NA
     summary["rewrite_error_rate"] = summary["rewrite_error_rate"] * 100.0
     return summary.sort_values("avg_request_ms", ascending=True)
 
@@ -502,19 +550,63 @@ def _apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
+def _show_metrics_collection_status(df: pd.DataFrame) -> None:
+    has_query_id_col = "search_query_id" in df.columns
+    has_cost_col = "request_cost_total_credits" in df.columns
+
+    if not has_query_id_col and not has_cost_col:
+        st.info(
+            "Loaded file schema does not include SQL metrics columns "
+            "(`search_query_id`, `request_cost_total_credits`)."
+        )
+        return
+
+    has_query_ids = (
+        df["search_query_id"].fillna("").astype(str).str.strip().ne("").any()
+        if has_query_id_col
+        else False
+    )
+    has_costs = (
+        df["request_cost_total_credits"].notna().any() if has_cost_col else False
+    )
+    if not has_query_ids and not has_costs:
+        st.info(
+            "This run has no collected SQL metrics. Re-run batch with "
+            "`COLLECT_SQL_METRICS=true` to populate `search_query_id` and credits."
+        )
+
+
 def _show_metrics(df: pd.DataFrame) -> None:
     request_count = len(df)
     unique_queries = df["original_query"].nunique(dropna=True)
     avg_request_ms = df["request_ms"].mean()
     avg_results = df["result_count_after_limit"].mean()
-    avg_cost = df["request_cost_total_credits"].mean()
+    avg_cost = (
+        df["request_cost_total_credits"].mean()
+        if "request_cost_total_credits" in df.columns
+        else None
+    )
+    rows_with_cost = (
+        int(df["request_cost_total_credits"].notna().sum())
+        if "request_cost_total_credits" in df.columns
+        else 0
+    )
+    rows_with_search_id = (
+        int(df["search_query_id"].fillna("").astype(str).str.strip().ne("").sum())
+        if "search_query_id" in df.columns
+        else 0
+    )
 
-    cols = st.columns(6)
+    cols = st.columns(7)
     cols[0].metric("Requests", f"{request_count}")
     cols[1].metric("Unique queries", f"{unique_queries}")
     cols[2].metric("Avg request ms", _format_maybe_number(avg_request_ms, digits=0))
-    cols[4].metric("Avg results", _format_maybe_number(avg_results, digits=2))
-    cols[5].metric("Avg credits", _format_maybe_number(avg_cost, digits=6))
+    cols[3].metric("Avg results", _format_maybe_number(avg_results, digits=2))
+    cols[4].metric("Avg credits", _format_maybe_number(avg_cost, digits=6))
+    cols[5].metric("Rows with cost", f"{rows_with_cost}/{request_count}")
+    cols[6].metric(
+        "Rows with search_query_id", f"{rows_with_search_id}/{request_count}"
+    )
 
 
 def _show_charts(df: pd.DataFrame) -> None:
@@ -660,6 +752,7 @@ def main() -> None:
         st.warning("No rows match current filters.")
         return
 
+    _show_metrics_collection_status(filtered)
     _show_metrics(filtered)
 
     st.subheader("Filtered requests")
@@ -675,6 +768,7 @@ def main() -> None:
         "request_ms",
         "result_count_after_limit",
         "request_cost_total_credits",
+        "search_query_id",
         "original_query",
         "rewritten_query",
         "excluded_terms_text",
