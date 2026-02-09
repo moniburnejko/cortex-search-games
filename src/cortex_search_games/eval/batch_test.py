@@ -51,7 +51,15 @@ LLM_MODELS = (
 TEMPS = (0.0, 0.6)
 USE_LLM = (False, True)
 QUERIES = (
+    "Is \"Hidden Cats in Krakow\" in the catalog? if not, show closest hidden cats city games",
+    "Cat Quest IV - if it's not, show me similar pirate cat action RPG (NOT Cat Quest II)",
+    "battle royale cat game set on Mars, but NOT shooting, NOT multiplayer, NOT violence",
+    "cozy cat cafe management sim, but NOT a visual novel, NOT anime, avoid dating sim",
+    "third-person cat adventure in a city, no horror, no gore",
+    "hidden object cats in a city, without timer, exclude leaderboard, avoid time attack",
     "neon cybercity cat adventure with a drone companion, stealthy exploration, mysterious robots",
+    "a lone cat in a neon, decaying city of robots; exploration, stealth, mystery (3rd person)",
+    "catventure: open-world 2D action RPG with cats and dogs, local co-op, loot and spells",
 )
 
 SERVICE = "CORTEX_DB.RAW.CAT_GAMES_SVC_1_5"
@@ -60,18 +68,50 @@ CAND_FACTOR = 10
 MAX_CAND = 500
 
 DEFAULT_SYSTEM_PROMPT = """
-You rewrite user queries for semantic search over a video games catalog.
-Return ONLY a JSON object with two keys: "query" and "exclude".
-- "query" is the rewritten search query (English, keyword-rich).
-- "exclude" is a list of keywords/tags that the user explicitly excludes
-  (based on negations like "no", "without", "not", "exclude", "avoid").
-Preserve user-provided tags/keywords (do not drop them).
-If the query is already good, return it unchanged.
-If you cannot improve it, return the original user query unchanged.
-Do NOT invent game titles. Focus on genres, mechanics, themes, and features.
-Example: {"query": "battle royale building survival shooting multiplayer",
-          "exclude": []}
-Example: {"query": "co-op sci-fi shooter space aliens", "exclude": ["cats"]}
+You rewrite user queries for hybrid (keyword + vector) search over a video games catalog.
+
+Return ONLY a valid JSON object with exactly two keys: "query" and "exclude".
+
+Hard requirements:
+- Output MUST be valid JSON (double quotes, no trailing commas).
+- Output MUST be a single JSON object and nothing else.
+- Output MUST be a single line.
+- Do NOT wrap the JSON in markdown fences/backticks and do NOT add explanations.
+- Always include both keys:
+  - "query": a string
+  - "exclude": an array of strings (use [] if there are no exclusions)
+- Do NOT return JSON as a string (no extra quotes around the whole object).
+- Do NOT add any additional keys.
+
+Input format:
+- The user query will appear as a line starting with: User query:
+- Use only that text as the input query to rewrite.
+
+Rewrite rules:
+- "query" must be short, English, keyword-rich, suitable for hybrid (keyword + vector) search.
+- Prefer 5–20 keywords / short phrases, not full sentences (less noise for embeddings).
+- Preserve user-provided keywords/tags (do not drop them).
+- Preserve concrete mechanic/mode/tag terms literally (helps keyword stage).
+- Add synonyms only when needed; avoid over-expansion that makes the query too generic.
+- Do NOT invent game titles. Focus on genres, mechanics, themes, and features.
+- If the query is already good, return it unchanged (normalize whitespace only).
+
+Exclusions:
+- If the user explicitly excludes something via negation (no/without/not/avoid/exclude),
+  add that term to "exclude".
+- "exclude" items should be simple keywords/tags, lowercase, no punctuation.
+- Exclusions have priority over the main query. If a term is in "exclude", it should not appear in "query".
+- If there are no exclusions, return "exclude": [].
+
+Examples:
+Input: User query: co-op multiplayer games set in Japan without cats
+Output: {"query":"co-op multiplayer Japan","exclude":["cats"]}
+
+Input: User query: battle royale with building, looting resources, and combat
+Output: {"query":"battle royale building looting combat","exclude":[]}
+
+Input: User query: puzzle game not horror, no gore
+Output: {"query":"puzzle","exclude":["horror","gore"]}
 """.strip()
 
 SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
@@ -84,8 +124,6 @@ OUTPUT_FILE = "test_drift_1_5"
 CONN_NAME = "cortex"
 CONN_TOML: Path | None = None
 LOG_LEVEL = "DEBUG"
-# Set to False when using Python API as it doesn't generate SQL query history
-# accessible via LAST_QUERY_ID in the same session context.
 COLLECT_SQL_METRICS = False
 
 
@@ -223,7 +261,6 @@ def _extract_query_history_metrics(
 
 def _last_query_id(session: Session) -> str:
     try:
-        # Snowpark execution
         rows = session.sql("SELECT LAST_QUERY_ID()").collect()
         row = rows[0] if rows else None
     except Exception as err:
@@ -485,7 +522,6 @@ def run_batch(
                     scoring_profile=cfg["profile"],
                     min_score=cfg["min_score"],
                 )
-                # Ensure results is a list (API might return an iterator/generator)
                 if not isinstance(results, list):
                     results = list(results)
 
