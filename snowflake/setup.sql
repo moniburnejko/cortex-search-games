@@ -227,6 +227,15 @@ as
 select * from dt_games
 where search_text like '%cats%';
 
+-- DT TEST DATA (show all)
+-- smaller dataset with broader variety of attributes for testing show all functionality
+create or replace dynamic table test_data 
+  target_lag = '12 hours'
+  warehouse = cortex_wh
+as 
+select * from dt_games
+where release_year between 2014 and 2016;
+
 
 //show tables;
 //select * from games_raw_file limit 10;
@@ -238,3 +247,5 @@ where search_text like '%cats%';
 //select * from dt_games limit 10;
 //select count(*) from dt_cat_games;
 //select * from dt_cat_games limit 10;
+//select count(*) from test_data;
+//select * from test_data limit 10;
