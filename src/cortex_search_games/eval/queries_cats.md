@@ -1,7 +1,7 @@
 all queries together
 ```python
 QUERIES = (
-    "cozy cat cafe management sim, but NOT a visual novel, NOT anime, avoid dating sim",
+    "cozy cat cafe management sim, but NOT a visual novel, NOT anime, avoid paid games",
     "third-person cat adventure in a city, no horror, no gore" ,
     "hidden object cats in a city, without timer, exclude leaderboard, avoid time attack",
     "Is \"Hidden Cats in Krakow\" in the catalog? if not, do not invent it; show closest hidden cats city games",
@@ -43,7 +43,7 @@ QUERIES = (
 negations
 ```python
 QUERIES = (
-    "cozy cat cafe management sim, but NOT a visual novel, NOT anime, avoid dating sim",
+    "cozy cat cafe management sim, but NOT a visual novel, NOT anime, avoid paid games",
     "third-person cat adventure in a city, no horror, no gore",
     "hidden object cats in a city, without timer, exclude leaderboard, avoid time attack",
 )

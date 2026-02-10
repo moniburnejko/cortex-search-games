@@ -45,16 +45,13 @@ PROFILES = (
     "reranker_heavy",
 )
 SCORE_TH = (0.3, 0.65, 0.75, 0.85)
-LLM_MODELS = (
-    "claude-4-sonnet",
-    "openai-gpt-4.1",
-)
+LLM_MODELS = ("claude-4-sonnet",)
 TEMPS = (0.0, 0.6)
-USE_LLM = (False, True)
+USE_LLM = (True,)
 QUERIES = (
-    "Is \"Hidden Cats in Krakow\" in the catalog? if not, show closest hidden cats city games",
-    "Cat Quest IV - if it's not, show me similar pirate cat action RPG (NOT Cat Quest II)",
-    "battle royale cat game set on Mars, but NOT shooting, NOT multiplayer, NOT violence",
+    "single-player ONLY, but I also need online co-op with friends",
+    "game about cats but NO cats (exclude cats) — yet the main character must be a cat",
+    "Stray-like cyberpunk cat adventure, but also 2D pixel-art top-down and turn-based",
 )
 
 SERVICE = "CORTEX_DB.RAW.CAT_GAMES_SVC_1_5"
@@ -199,7 +196,9 @@ LLM_MAX_TOKENS = 120
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 OUTPUT_DIR = PROJECT_ROOT / "output"
-OUTPUT_FILE = "test_emb_1_5_p1"
+OUTPUT_FILE = "claude_p6_emb_15"
+LOG_DIR = PROJECT_ROOT / "logs"
+LOG_FILE = LOG_DIR / "batch_test.log"
 
 CONN_NAME = "cortex"
 CONN_TOML: Path | None = None
@@ -246,13 +245,25 @@ def _format_str_list(val: Any) -> list[str]:
     return []
 
 
-def setup_log(level: str = LOG_LEVEL) -> None:
+def setup_log(level: str = LOG_LEVEL, log_file: Path = LOG_FILE) -> Path:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_format = "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+
     logger.remove()
     logger.add(
         sys.stderr,
         level=level.upper(),
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+        format=log_format,
     )
+    logger.add(
+        log_file,
+        level=level.upper(),
+        format=log_format,
+        encoding="utf-8",
+        rotation="10 MB",
+        retention=10,
+    )
+    return log_file
 
 
 def _to_float(val: Any) -> float | None:
@@ -478,9 +489,77 @@ def _query_history_metrics(
     return _empty_query_history_metrics(query_id)
 
 
+def _combine_query_histories(
+    query_ids: tuple[str, ...], histories: tuple[dict[str, Any], ...]
+) -> dict[str, Any]:
+    combined_query_id = ";".join(qid for qid in query_ids if qid)
+    if not histories:
+        return _empty_query_history_metrics(combined_query_id)
+
+    total_elapsed_ms = _sum_optional_ints(
+        tuple(_to_int(history.get("total_elapsed_ms")) for history in histories)
+    )
+    execution_ms = _sum_optional_ints(
+        tuple(_to_int(history.get("execution_ms")) for history in histories)
+    )
+    compilation_ms = _sum_optional_ints(
+        tuple(_to_int(history.get("compilation_ms")) for history in histories)
+    )
+    bytes_scanned = _sum_optional_ints(
+        tuple(_to_int(history.get("bytes_scanned")) for history in histories)
+    )
+    cloud_credits = _sum_optional_floats(
+        tuple(
+            _to_float(history.get("cost_cloud_services_credits"))
+            for history in histories
+        )
+    )
+    compute_credits = _sum_optional_floats(
+        tuple(_to_float(history.get("cost_compute_credits")) for history in histories)
+    )
+    query_accel_credits = _sum_optional_floats(
+        tuple(
+            _to_float(history.get("cost_query_accel_credits")) for history in histories
+        )
+    )
+    total_credits = _sum_optional_floats(
+        (
+            cloud_credits,
+            compute_credits,
+            query_accel_credits,
+        )
+    )
+
+    return {
+        "query_id": combined_query_id,
+        "total_elapsed_ms": total_elapsed_ms,
+        "execution_ms": execution_ms,
+        "compilation_ms": compilation_ms,
+        "bytes_scanned": bytes_scanned,
+        "cost_cloud_services_credits": cloud_credits,
+        "cost_compute_credits": compute_credits,
+        "cost_query_accel_credits": query_accel_credits,
+        "cost_total_credits": total_credits,
+    }
+
+
+def _should_retry_without_attribute_filters(
+    *,
+    use_attribute_filters: bool,
+    tags: list[str],
+    supported_languages: list[str],
+    release_year: int | None,
+    result_count: int,
+) -> bool:
+    if not use_attribute_filters:
+        return False
+    if result_count > 0:
+        return False
+    return bool(tags or supported_languages or release_year is not None)
+
+
 def _requests_file_path(out_path: Path) -> Path:
-    suffix = out_path.suffix or ".json"
-    return out_path.with_name(f"{out_path.stem}_requests{suffix}")
+    return out_path.with_name(f"{out_path.stem}_requests.csv")
 
 
 def _csv_cell(value: Any) -> Any:
@@ -753,9 +832,13 @@ def run_batch(
                         )
                         matched_year = year_int if year_int in years_known else None
 
-                    attr_tags = matched_tags if use_attr else []
-                    attr_langs = matched_langs if use_attr else []
-                    attr_year = matched_year if use_attr else None
+                    requested_attr_tags = matched_tags if use_attr else []
+                    requested_attr_langs = matched_langs if use_attr else []
+                    requested_attr_year = matched_year if use_attr else None
+                    applied_attr_tags = requested_attr_tags
+                    applied_attr_langs = requested_attr_langs
+                    applied_attr_year = requested_attr_year
+                    attr_filters_relaxed = False
 
                     t1 = time.perf_counter()
                     results = query_cortex_search_service(
@@ -766,20 +849,61 @@ def run_batch(
                         candidate_limit=cand_limit,
                         scoring_profile=cfg["profile"],
                         min_score=cfg["min_score"],
-                        tags=attr_tags,
-                        supported_languages=attr_langs,
-                        release_year=attr_year,
+                        tags=applied_attr_tags,
+                        supported_languages=applied_attr_langs,
+                        release_year=applied_attr_year,
                     )
                     if not isinstance(results, list):
                         results = list(results)
+                    search_query_ids: list[str] = []
+                    search_histories: list[dict[str, Any]] = []
+                    if COLLECT_SQL_METRICS:
+                        query_id = _last_query_id(session)
+                        search_query_ids.append(query_id)
+                        search_histories.append(
+                            _query_history_metrics(session, query_id)
+                        )
+
+                    if _should_retry_without_attribute_filters(
+                        use_attribute_filters=use_attr,
+                        tags=applied_attr_tags,
+                        supported_languages=applied_attr_langs,
+                        release_year=applied_attr_year,
+                        result_count=len(results),
+                    ):
+                        attr_filters_relaxed = True
+                        applied_attr_tags = []
+                        applied_attr_langs = []
+                        applied_attr_year = None
+
+                        results = query_cortex_search_service(
+                            session,
+                            service_fqn=svc,
+                            query=rew_q,
+                            columns=cols,
+                            candidate_limit=cand_limit,
+                            scoring_profile=cfg["profile"],
+                            min_score=cfg["min_score"],
+                            tags=applied_attr_tags,
+                            supported_languages=applied_attr_langs,
+                            release_year=applied_attr_year,
+                        )
+                        if not isinstance(results, list):
+                            results = list(results)
+
+                        if COLLECT_SQL_METRICS:
+                            query_id = _last_query_id(session)
+                            search_query_ids.append(query_id)
+                            search_histories.append(
+                                _query_history_metrics(session, query_id)
+                            )
 
                     results = filter_exclusions(results, exclude_terms)
                     search_ms = round((time.perf_counter() - t1) * 1000)
-                    if COLLECT_SQL_METRICS:
-                        search_query_id = _last_query_id(session)
-                        search_history = _query_history_metrics(
-                            session, search_query_id
-                        )
+                    search_query_id = ";".join(qid for qid in search_query_ids if qid)
+                    search_history = _combine_query_histories(
+                        tuple(search_query_ids), tuple(search_histories)
+                    )
 
                     ts = datetime.now(UTC).isoformat(timespec="seconds")
                     request_cost_credits = _sum_optional_floats(
@@ -852,9 +976,14 @@ def run_batch(
                         "release_year_raw": year_int,
                         "release_year_matched": matched_year,
                         "attribute_filters_enabled": use_attr,
-                        "attribute_filter_tags": attr_tags,
-                        "attribute_filter_supported_languages": attr_langs,
-                        "attribute_filter_release_year": attr_year,
+                        "attribute_filters_relaxed": attr_filters_relaxed,
+                        "attribute_filter_tags_requested": requested_attr_tags,
+                        "attribute_filter_supported_languages_"
+                        "requested": requested_attr_langs,
+                        "attribute_filter_release_year_requested": requested_attr_year,
+                        "attribute_filter_tags": applied_attr_tags,
+                        "attribute_filter_supported_languages": applied_attr_langs,
+                        "attribute_filter_release_year": applied_attr_year,
                     }
 
                     request_rows.append(
@@ -881,7 +1010,9 @@ def run_batch(
                                 ),
                                 "genres": ";".join(_format_str_list(row.get("GENRES"))),
                                 "tags": ";".join(result_tags(row)),
-                                "about_the_game": (row.get("ABOUT_THE_GAME") or "")[:500],
+                                "about_the_game": (row.get("ABOUT_THE_GAME") or "")[
+                                    :500
+                                ],
                                 "scores_json": json.dumps(
                                     result_scores(row) or {},
                                     ensure_ascii=False,
@@ -890,18 +1021,13 @@ def run_batch(
                         )
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / out_file
-    requests_path = _requests_file_path(out_path)
-    out_csv_path = out_path.with_suffix(".csv")
+    out_base_path = out_dir / out_file
+    out_csv_path = (
+        out_base_path
+        if out_base_path.suffix.lower() == ".csv"
+        else out_base_path.with_suffix(".csv")
+    )
     requests_csv_path = _requests_file_path(out_csv_path)
-    out_path.write_text(
-        json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    requests_path.write_text(
-        json.dumps(request_rows, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
     _write_rows_csv(out_csv_path, rows)
     _write_rows_csv(requests_csv_path, request_rows)
 
@@ -910,9 +1036,7 @@ def run_batch(
         "total_request_configs": req_count,
         "request_rows_written": len(request_rows),
         "rows_written": len(rows),
-        "local_file": str(out_path),
-        "local_requests_file": str(requests_path),
-        "local_csv_file": str(out_csv_path),
+        "local_results_csv_file": str(out_csv_path),
         "local_requests_csv_file": str(requests_csv_path),
     }
 
@@ -936,7 +1060,8 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    setup_log()
+    log_file = setup_log()
+    logger.info("Logging batch output to {}", log_file)
 
     try:
         args = _parse_args()
