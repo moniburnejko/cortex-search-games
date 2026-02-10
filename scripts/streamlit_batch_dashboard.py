@@ -527,13 +527,19 @@ def _apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     if not score_values.empty:
         min_score = float(score_values.min())
         max_score = float(score_values.max())
-        selected_range = st.sidebar.slider(
-            "Min score range",
-            min_value=min_score,
-            max_value=max_score,
-            value=(min_score, max_score),
-            step=0.01,
-        )
+        if abs(max_score - min_score) < 1e-12:
+            selected_range = (min_score, max_score)
+            st.sidebar.caption(
+                f"Min score range is fixed at {min_score:.2f} for this run."
+            )
+        else:
+            selected_range = st.sidebar.slider(
+                "Min score range",
+                min_value=min_score,
+                max_value=max_score,
+                value=(min_score, max_score),
+                step=0.01,
+            )
         filtered = filtered[
             filtered["min_score"].between(selected_range[0], selected_range[1])
         ]
