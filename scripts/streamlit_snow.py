@@ -38,7 +38,7 @@ RETURN_COLS = [
     "TAGS",
 ]
 MIN_SCORE = 0.75
-SHOW_ALL_MIN_SCORE = 0.75
+SHOW_ALL_MIN_SCORE = 0.5
 MAX_CORTEX_SEARCH_LIMIT = 1000
 MAX_DEBUG_SCAN_ROWS = 50
 DEFAULT_LLM_MAX_TOKENS = 120
@@ -47,8 +47,9 @@ DEFAULT_SYSTEM_PROMPT = """
 You rewrite user queries for hybrid (keyword + vector) search
 over a video games catalog.
 
-Return ONLY a valid JSON object with exactly five keys:
-"query", "include_tags", "exclude", "release_year", "supported_languages".
+Return ONLY a valid JSON object with exactly seven keys:
+"query", "include_tags", "exclude", "release_year",
+"release_year_from", "release_year_to", "supported_languages".
 
 Hard requirements:
 - Output MUST be valid JSON (double quotes, no trailing commas).
@@ -60,6 +61,8 @@ Hard requirements:
   - "include_tags": an array of strings (use [] if none)
   - "exclude": an array of strings (use [] if none)
   - "release_year": an integer year or null
+  - "release_year_from": an integer year or null
+  - "release_year_to": an integer year or null
   - "supported_languages": an array of strings (use [] if none)
 - Do NOT return JSON as a string (no extra quotes around the whole object).
 - Do NOT add any additional keys.
@@ -84,6 +87,8 @@ Attribute extraction:
 - If a term appears in "exclude", it must NOT appear in "include_tags" or "query".
 - Extract "release_year" only when explicitly requested
   as a single year (otherwise null).
+- Extract "release_year_from" and "release_year_to" only when the user asks
+  for a year range (e.g. between/from-to). For single-year queries keep both null.
 - Extract "supported_languages" only when explicitly requested.
 
 Exclusions and negations:
@@ -95,24 +100,33 @@ Exclusions and negations:
 Examples:
 Input: User query: co-op multiplayer games set in Japan without cats
 Output: {"query":"co-op multiplayer Japan","include_tags":[],"exclude":["cats"],
-"release_year":null,"supported_languages":[]}
+"release_year":null,"release_year_from":null,"release_year_to":null,
+"supported_languages":[]}
 
 Input: User query: battle royale with building, looting resources, and combat
 Output: {"query":"battle royale building looting combat","include_tags":[],
-"exclude":[],"release_year":null,"supported_languages":[]}
+"exclude":[],"release_year":null,"release_year_from":null,
+"release_year_to":null,"supported_languages":[]}
 
 Input: User query: puzzle game not horror, no gore
 Output: {"query":"puzzle","include_tags":[],"exclude":["horror","gore"],
-"release_year":null,"supported_languages":[]}
+"release_year":null,"release_year_from":null,"release_year_to":null,
+"supported_languages":[]}
 
 Input: User query: i want to play something like cyberpunk but with cats, no multiplayer
 Output: {"query":"cyberpunk cats futuristic sci-fi single player",
 "include_tags":["cyberpunk","cats"],"exclude":["multiplayer"],
-"release_year":null,"supported_languages":[]}
+"release_year":null,"release_year_from":null,"release_year_to":null,
+"supported_languages":[]}
 
 Input: User query: french hidden object game from 2022 without timer
 Output: {"query":"hidden object","include_tags":[],"exclude":["timer"],
-"release_year":2022,"supported_languages":["french"]}
+"release_year":2022,"release_year_from":null,"release_year_to":null,
+"supported_languages":["french"]}
+
+Input: User query: show me games released between 2014 and 2016
+Output: {"query":"games","include_tags":[],"exclude":[],"release_year":null,
+"release_year_from":2014,"release_year_to":2016,"supported_languages":[]}
 """.strip()
 
 LLM_MODELS = [
@@ -235,12 +249,41 @@ def _normalize_release_year(raw: Any) -> int | None:
     return year
 
 
+def _normalize_release_year_range(
+    *,
+    release_year: Any,
+    release_year_from: Any,
+    release_year_to: Any,
+) -> tuple[int | None, int | None, int | None]:
+    year = _normalize_release_year(release_year)
+    year_from = _normalize_release_year(release_year_from)
+    year_to = _normalize_release_year(release_year_to)
+
+    if year_from is None and year_to is None:
+        return year, None, None
+
+    if year_from is None:
+        year_from = year
+    if year_to is None:
+        year_to = year
+
+    if year_from is not None and year_to is not None and year_from > year_to:
+        year_from, year_to = year_to, year_from
+
+    if year_from is not None and year_to is not None and year_from == year_to:
+        return year_from, None, None
+
+    return None, year_from, year_to
+
+
 def _empty_rewrite_payload(user_query: str) -> dict[str, Any]:
     return {
         "query": user_query,
         "exclude": [],
         "include_tags": [],
         "release_year": None,
+        "release_year_from": None,
+        "release_year_to": None,
         "supported_languages": [],
     }
 
@@ -284,8 +327,21 @@ def _try_parse_payload_details(text: str) -> dict[str, Any] | None:
         supported_languages = _normalize_filter_list(
             parsed_dict.get("supported_languages", parsed_dict.get("languages", []))
         )
-        release_year = _normalize_release_year(
-            parsed_dict.get("release_year", parsed_dict.get("year"))
+        release_year_raw = parsed_dict.get("release_year", parsed_dict.get("year"))
+        release_year_from_raw = parsed_dict.get(
+            "release_year_from",
+            parsed_dict.get("year_from", parsed_dict.get("start_year")),
+        )
+        release_year_to_raw = parsed_dict.get(
+            "release_year_to",
+            parsed_dict.get("year_to", parsed_dict.get("end_year")),
+        )
+        release_year, release_year_from, release_year_to = (
+            _normalize_release_year_range(
+                release_year=release_year_raw,
+                release_year_from=release_year_from_raw,
+                release_year_to=release_year_to_raw,
+            )
         )
         exclude = _merge_filter_terms(
             _normalize_filter_list(parsed_dict.get("exclude", [])),
@@ -298,6 +354,8 @@ def _try_parse_payload_details(text: str) -> dict[str, Any] | None:
             "exclude": exclude,
             "include_tags": include_tags,
             "release_year": release_year,
+            "release_year_from": release_year_from,
+            "release_year_to": release_year_to,
             "supported_languages": supported_languages,
         }
 
@@ -514,6 +572,8 @@ def _finalize_rewrite_payload(
     exclude: list[str],
     include_tags: list[str],
     release_year: Any,
+    release_year_from: Any,
+    release_year_to: Any,
     supported_languages: list[str],
     user_query: str,
 ) -> dict[str, Any]:
@@ -525,11 +585,18 @@ def _finalize_rewrite_payload(
         include_tags=include_tags_clean,
         user_query=user_query,
     )
+    year, year_from, year_to = _normalize_release_year_range(
+        release_year=release_year,
+        release_year_from=release_year_from,
+        release_year_to=release_year_to,
+    )
     return {
         "query": rewritten,
         "exclude": exclude_terms,
         "include_tags": include_tags_clean,
-        "release_year": _normalize_release_year(release_year),
+        "release_year": year,
+        "release_year_from": year_from,
+        "release_year_to": year_to,
         "supported_languages": _normalize_filter_values(supported_languages),
     }
 
@@ -617,6 +684,48 @@ def _match_known_filter_values(
     return matched, missing
 
 
+def _match_release_year_filters(
+    *,
+    available_years: list[int],
+    release_year: int | None,
+    release_year_from: int | None,
+    release_year_to: int | None,
+) -> tuple[int | None, int | None, int | None]:
+    year, year_from, year_to = _normalize_release_year_range(
+        release_year=release_year,
+        release_year_from=release_year_from,
+        release_year_to=release_year_to,
+    )
+
+    if year is not None:
+        if not available_years or year in set(available_years):
+            return year, None, None
+        return None, None, None
+
+    if year_from is None and year_to is None:
+        return None, None, None
+
+    if not available_years:
+        return None, year_from, year_to
+
+    years_sorted = sorted(set(available_years))
+    lower = year_from if year_from is not None else years_sorted[0]
+    upper = year_to if year_to is not None else years_sorted[-1]
+    lower = max(lower, years_sorted[0])
+    upper = min(upper, years_sorted[-1])
+    if lower > upper:
+        return None, None, None
+
+    years_in_range = [
+        year_val for year_val in years_sorted if lower <= year_val <= upper
+    ]
+    if not years_in_range:
+        return None, None, None
+    if len(years_in_range) == 1:
+        return years_in_range[0], None, None
+    return None, years_in_range[0], years_in_range[-1]
+
+
 def _row_text_blob(row: dict[str, Any]) -> str:
     parts = [
         str(row.get("NAME") or ""),
@@ -643,10 +752,13 @@ def _filter_exclusions(
     terms = _normalize_exclusions(exclude)
     if not terms:
         return rows
+    patterns = [pattern for term in terms if (pattern := _compile_term_pattern(term))]
+    if not patterns:
+        return rows
     out: list[dict[str, Any]] = []
     for row in rows:
         blob = _row_text_blob(row)
-        if any(term in blob for term in terms):
+        if any(pattern.search(blob) for pattern in patterns):
             continue
         out.append(row)
     return out
@@ -833,6 +945,8 @@ def _build_attribute_filter(
     tags: list[str] | None,
     supported_languages: list[str] | None,
     release_year: int | None,
+    release_year_from: int | None,
+    release_year_to: int | None,
 ) -> dict[str, Any] | None:
     clauses: list[dict[str, Any]] = []
 
@@ -842,16 +956,31 @@ def _build_attribute_filter(
     for language in _normalize_filter_values(supported_languages):
         clauses.append({"@contains": {"supported_languages": language}})
 
-    if release_year is not None:
-        if isinstance(release_year, bool):
-            raise ValueError("release_year must be an integer")
-        try:
-            year = int(release_year)
-        except (TypeError, ValueError) as err:
-            raise ValueError("release_year must be an integer") from err
-        if year <= 0:
-            raise ValueError("release_year must be > 0")
+    year = _normalize_release_year(release_year)
+    if release_year is not None and year is None:
+        raise ValueError("release_year must be an integer")
+
+    year_from = _normalize_release_year(release_year_from)
+    if release_year_from is not None and year_from is None:
+        raise ValueError("release_year_from must be an integer")
+
+    year_to = _normalize_release_year(release_year_to)
+    if release_year_to is not None and year_to is None:
+        raise ValueError("release_year_to must be an integer")
+
+    if year is not None:
         clauses.append({"@eq": {"release_year": year}})
+    else:
+        if (
+            year_from is not None
+            and year_to is not None
+            and year_from > year_to
+        ):
+            raise ValueError("release_year_from cannot be greater than release_year_to")
+        if year_from is not None:
+            clauses.append({"@gte": {"release_year": year_from}})
+        if year_to is not None:
+            clauses.append({"@lte": {"release_year": year_to}})
 
     if not clauses:
         return None
@@ -906,6 +1035,8 @@ def _build_search_request(
     tags: list[str] | None = None,
     supported_languages: list[str] | None = None,
     release_year: int | None = None,
+    release_year_from: int | None = None,
+    release_year_to: int | None = None,
 ) -> dict[str, Any]:
     req: dict[str, Any] = {
         "query": query,
@@ -918,6 +1049,8 @@ def _build_search_request(
         tags=tags,
         supported_languages=supported_languages,
         release_year=release_year,
+        release_year_from=release_year_from,
+        release_year_to=release_year_to,
     )
     if attr_filter:
         req["filter"] = attr_filter
@@ -1048,6 +1181,8 @@ def rewrite_query(
             exclude=list(parsed.get("exclude") or []),
             include_tags=list(parsed.get("include_tags") or []),
             release_year=parsed.get("release_year"),
+            release_year_from=parsed.get("release_year_from"),
+            release_year_to=parsed.get("release_year_to"),
             supported_languages=list(parsed.get("supported_languages") or []),
             user_query=user_query,
         )
@@ -1064,6 +1199,8 @@ def rewrite_query(
             exclude=[],
             include_tags=[],
             release_year=None,
+            release_year_from=None,
+            release_year_to=None,
             supported_languages=[],
             user_query=user_query,
         )
@@ -1197,7 +1334,7 @@ def render_form(filter_options: dict[str, Any]) -> dict[str, Any]:
                 help=(
                     "0 = no filtering, 0.3 = minimum, "
                     "0.6-0.75 recommended, >0.75 = very strict. "
-                    "SHOW ALL enforces 0.75."
+                    "SHOW ALL enforces 0.50."
                 ),
             )
         with st.expander("Debugging", expanded=False):
@@ -1350,6 +1487,10 @@ def main() -> None:
     llm_tags_unknown: list[str] = []
     llm_languages_unknown: list[str] = []
     llm_release_year_effective: int | None = None
+    llm_release_year_from_raw: int | None = None
+    llm_release_year_to_raw: int | None = None
+    llm_release_year_from_effective: int | None = None
+    llm_release_year_to_effective: int | None = None
     show_all = bool(form["show_all"])
     effective_scoring = (
         "no_reranker_balanced" if show_all else (form["scoring"] or None)
@@ -1422,6 +1563,12 @@ def main() -> None:
             llm_release_year_raw = _normalize_release_year(
                 rewrite_payload.get("release_year")
             )
+            llm_release_year_from_raw = _normalize_release_year(
+                rewrite_payload.get("release_year_from")
+            )
+            llm_release_year_to_raw = _normalize_release_year(
+                rewrite_payload.get("release_year_to")
+            )
 
             llm_tags_matched, llm_tags_unknown = _match_known_filter_values(
                 llm_tags_raw,
@@ -1431,17 +1578,21 @@ def main() -> None:
                 llm_languages_raw,
                 list(filter_options.get("supported_languages", [])),
             )
-            release_years: set[int] = set()
+            release_years: list[int] = []
             for raw in filter_options.get("release_years", []):
                 year = _normalize_release_year(raw)
                 if year is not None:
-                    release_years.add(year)
-            if llm_release_year_raw is None:
-                llm_release_year_effective = None
-            elif not release_years or llm_release_year_raw in release_years:
-                llm_release_year_effective = llm_release_year_raw
-            else:
-                llm_release_year_effective = None
+                    release_years.append(year)
+            (
+                llm_release_year_effective,
+                llm_release_year_from_effective,
+                llm_release_year_to_effective,
+            ) = _match_release_year_filters(
+                available_years=release_years,
+                release_year=llm_release_year_raw,
+                release_year_from=llm_release_year_from_raw,
+                release_year_to=llm_release_year_to_raw,
+            )
 
             with st.expander("LLM rewritten query", expanded=False):
                 st.code(q)
@@ -1455,6 +1606,21 @@ def main() -> None:
                     )
                 if llm_release_year_effective is not None:
                     st.caption(f"LLM release year filter: {llm_release_year_effective}")
+                elif (
+                    llm_release_year_from_effective is not None
+                    or llm_release_year_to_effective is not None
+                ):
+                    low = (
+                        str(llm_release_year_from_effective)
+                        if llm_release_year_from_effective is not None
+                        else "any"
+                    )
+                    high = (
+                        str(llm_release_year_to_effective)
+                        if llm_release_year_to_effective is not None
+                        else "any"
+                    )
+                    st.caption(f"LLM release year range filter: {low} to {high}")
                 if llm_tags_unknown:
                     st.caption(
                         "Ignored LLM tags not in attribute dictionary: "
@@ -1466,10 +1632,18 @@ def main() -> None:
                         f"{', '.join(llm_languages_unknown)}"
                     )
                 if (
-                    llm_release_year_raw is not None
+                    (
+                        llm_release_year_raw is not None
+                        or llm_release_year_from_raw is not None
+                        or llm_release_year_to_raw is not None
+                    )
                     and llm_release_year_effective is None
+                    and llm_release_year_from_effective is None
+                    and llm_release_year_to_effective is None
                 ):
-                    st.caption("Ignored LLM release year not found in current dataset.")
+                    st.caption(
+                        "Ignored LLM release year filter not found in current dataset."
+                    )
 
     selected_tags = _normalize_filter_values(
         _merge_filter_terms(list(form["filter_tags"]), llm_tags_matched)
@@ -1486,6 +1660,12 @@ def main() -> None:
         if manual_release_year is not None
         else llm_release_year_effective
     )
+    selected_release_year_from = (
+        None if manual_release_year is not None else llm_release_year_from_effective
+    )
+    selected_release_year_to = (
+        None if manual_release_year is not None else llm_release_year_to_effective
+    )
 
     cols = list(RETURN_COLS)
     if form["debug_include_search_text"] and "SEARCH_TEXT" not in cols:
@@ -1499,6 +1679,8 @@ def main() -> None:
         tags=selected_tags,
         supported_languages=selected_languages,
         release_year=selected_release_year,
+        release_year_from=selected_release_year_from,
+        release_year_to=selected_release_year_to,
     )
 
     try:
