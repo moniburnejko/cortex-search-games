@@ -63,6 +63,33 @@ def _normalize_release_year(raw: Any) -> int | None:
     return year
 
 
+def _normalize_release_year_range(
+    *,
+    release_year: Any,
+    release_year_from: Any,
+    release_year_to: Any,
+) -> tuple[int | None, int | None, int | None]:
+    year = _normalize_release_year(release_year)
+    year_from = _normalize_release_year(release_year_from)
+    year_to = _normalize_release_year(release_year_to)
+
+    if year_from is None and year_to is None:
+        return year, None, None
+
+    if year_from is None:
+        year_from = year
+    if year_to is None:
+        year_to = year
+
+    if year_from is not None and year_to is not None and year_from > year_to:
+        year_from, year_to = year_to, year_from
+
+    if year_from is not None and year_to is not None and year_from == year_to:
+        return year_from, None, None
+
+    return None, year_from, year_to
+
+
 def strip_code_fences(text: str) -> str:
     txt = text.strip()
     if not txt.startswith("```"):
@@ -132,8 +159,21 @@ def try_parse_rewrite_payload_details(text: str) -> dict[str, Any] | None:
         supported_languages = _normalize_filter_list(
             parsed_dict.get("supported_languages", parsed_dict.get("languages", []))
         )
-        release_year = _normalize_release_year(
-            parsed_dict.get("release_year", parsed_dict.get("year"))
+        release_year_raw = parsed_dict.get("release_year", parsed_dict.get("year"))
+        release_year_from_raw = parsed_dict.get(
+            "release_year_from",
+            parsed_dict.get("year_from", parsed_dict.get("start_year")),
+        )
+        release_year_to_raw = parsed_dict.get(
+            "release_year_to",
+            parsed_dict.get("year_to", parsed_dict.get("end_year")),
+        )
+        release_year, release_year_from, release_year_to = (
+            _normalize_release_year_range(
+                release_year=release_year_raw,
+                release_year_from=release_year_from_raw,
+                release_year_to=release_year_to_raw,
+            )
         )
         exclude = _merge_filter_terms(
             _normalize_filter_list(parsed_dict.get("exclude", [])),
@@ -146,6 +186,8 @@ def try_parse_rewrite_payload_details(text: str) -> dict[str, Any] | None:
             "exclude": exclude,
             "include_tags": include_tags,
             "release_year": release_year,
+            "release_year_from": release_year_from,
+            "release_year_to": release_year_to,
             "supported_languages": supported_languages,
         }
 
@@ -381,6 +423,8 @@ def _finalize_rewrite_payload(
     exclude: Sequence[str],
     include_tags: Sequence[str],
     release_year: Any,
+    release_year_from: Any,
+    release_year_to: Any,
     supported_languages: Sequence[str],
     user_query: str,
 ) -> dict[str, Any]:
@@ -392,11 +436,18 @@ def _finalize_rewrite_payload(
         include_tags=include_tags_clean,
         user_query=user_query,
     )
+    year, year_from, year_to = _normalize_release_year_range(
+        release_year=release_year,
+        release_year_from=release_year_from,
+        release_year_to=release_year_to,
+    )
     return {
         "query": rewritten,
         "exclude": exclude_terms,
         "include_tags": include_tags_clean,
-        "release_year": _normalize_release_year(release_year),
+        "release_year": year,
+        "release_year_from": year_from,
+        "release_year_to": year_to,
         "supported_languages": _normalize_filter_values(supported_languages),
     }
 
@@ -472,10 +523,13 @@ def filter_exclusions(
     terms = _normalize_exclusions(exclude)
     if not terms:
         return rows
+    patterns = [pattern for term in terms if (pattern := _compile_term_pattern(term))]
+    if not patterns:
+        return rows
     out: list[dict[str, Any]] = []
     for row in rows:
         blob = _row_text_blob(row)
-        if any(term in blob for term in terms):
+        if any(pattern.search(blob) for pattern in patterns):
             continue
         out.append(row)
     return out
@@ -529,6 +583,8 @@ def _build_attribute_filter(
     tags: Sequence[str] | None = None,
     genres: Sequence[str] | None = None,
     release_year: int | None = None,
+    release_year_from: int | None = None,
+    release_year_to: int | None = None,
     supported_languages: Sequence[str] | None = None,
 ) -> dict[str, Any] | None:
     clauses: list[dict[str, Any]] = []
@@ -539,16 +595,31 @@ def _build_attribute_filter(
     for genre in _normalize_filter_values(genres):
         clauses.append({"@contains": {"genres": genre}})
 
-    if release_year is not None:
-        if isinstance(release_year, bool):
-            raise ValueError("release_year must be an integer")
-        try:
-            year = int(release_year)
-        except (TypeError, ValueError) as err:
-            raise ValueError("release_year must be an integer") from err
-        if year <= 0:
-            raise ValueError("release_year must be > 0")
+    year = _normalize_release_year(release_year)
+    if release_year is not None and year is None:
+        raise ValueError("release_year must be an integer")
+
+    year_from = _normalize_release_year(release_year_from)
+    if release_year_from is not None and year_from is None:
+        raise ValueError("release_year_from must be an integer")
+
+    year_to = _normalize_release_year(release_year_to)
+    if release_year_to is not None and year_to is None:
+        raise ValueError("release_year_to must be an integer")
+
+    if year is not None:
         clauses.append({"@eq": {"release_year": year}})
+    else:
+        if (
+            year_from is not None
+            and year_to is not None
+            and year_from > year_to
+        ):
+            raise ValueError("release_year_from cannot be greater than release_year_to")
+        if year_from is not None:
+            clauses.append({"@gte": {"release_year": year_from}})
+        if year_to is not None:
+            clauses.append({"@lte": {"release_year": year_to}})
 
     for language in _normalize_filter_values(supported_languages):
         clauses.append({"@contains": {"supported_languages": language}})
@@ -571,6 +642,8 @@ def _build_search_args(
     tags: Sequence[str] | None = None,
     genres: Sequence[str] | None = None,
     release_year: int | None = None,
+    release_year_from: int | None = None,
+    release_year_to: int | None = None,
     supported_languages: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     if not query.strip():
@@ -593,6 +666,8 @@ def _build_search_args(
         tags=tags,
         genres=genres,
         release_year=release_year,
+        release_year_from=release_year_from,
+        release_year_to=release_year_to,
         supported_languages=supported_languages,
     )
     if attr_filter:
@@ -613,6 +688,8 @@ def _build_search_payload(
     tags: Sequence[str] | None = None,
     genres: Sequence[str] | None = None,
     release_year: int | None = None,
+    release_year_from: int | None = None,
+    release_year_to: int | None = None,
     supported_languages: Sequence[str] | None = None,
 ) -> str:
     search_args = _build_search_args(
@@ -623,6 +700,8 @@ def _build_search_payload(
         tags=tags,
         genres=genres,
         release_year=release_year,
+        release_year_from=release_year_from,
+        release_year_to=release_year_to,
         supported_languages=supported_languages,
     )
     return json.dumps(search_args, ensure_ascii=False)
@@ -731,6 +810,8 @@ def rewrite_query_with_llm_details(
             exclude=list(parsed.get("exclude") or []),
             include_tags=list(parsed.get("include_tags") or []),
             release_year=parsed.get("release_year"),
+            release_year_from=parsed.get("release_year_from"),
+            release_year_to=parsed.get("release_year_to"),
             supported_languages=list(parsed.get("supported_languages") or []),
             user_query=user_query,
         )
@@ -747,6 +828,8 @@ def rewrite_query_with_llm_details(
             exclude=[],
             include_tags=[],
             release_year=None,
+            release_year_from=None,
+            release_year_to=None,
             supported_languages=[],
             user_query=user_query,
         )
@@ -772,6 +855,8 @@ def query_cortex_search_service(
     tags: Sequence[str] | None = None,
     genres: Sequence[str] | None = None,
     release_year: int | None = None,
+    release_year_from: int | None = None,
+    release_year_to: int | None = None,
     supported_languages: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     parts = service_fqn.split(".")
@@ -790,6 +875,8 @@ def query_cortex_search_service(
         tags=tags,
         genres=genres,
         release_year=release_year,
+        release_year_from=release_year_from,
+        release_year_to=release_year_to,
         supported_languages=supported_languages,
     )
 

@@ -45,13 +45,15 @@ PROFILES = (
     "reranker_heavy",
 )
 SCORE_TH = (0.3, 0.65, 0.75, 0.85)
-LLM_MODELS = ("claude-4-sonnet",)
+LLM_MODELS = (
+    "claude-4-sonnet",
+    "openai-gpt-4.1",)
 TEMPS = (0.0, 0.6)
-USE_LLM = (True,)
+USE_LLM = (False,)
 QUERIES = (
-    "single-player ONLY, but I also need online co-op with friends",
-    "game about cats but NO cats (exclude cats) — yet the main character must be a cat",
-    "Stray-like cyberpunk cat adventure, but also 2D pixel-art top-down and turn-based",
+    "2025 cozy idle \"desktop\" cat cafe at the bottom of the screen; automation; idler",
+    "digital board game: rescue cats tiles into a boat, strategy, sailing theme",
+    "early access tile-building worldbuilder, time traveler, far-future cats rule the galaxy",
 )
 
 SERVICE = "CORTEX_DB.RAW.CAT_GAMES_SVC_1_5"
@@ -64,8 +66,9 @@ DEFAULT_SYSTEM_PROMPT = """
 You rewrite user queries for hybrid (keyword + vector) search
 over a video games catalog.
 
-Return ONLY a valid JSON object with exactly five keys:
-"query", "include_tags", "exclude", "release_year", "supported_languages".
+Return ONLY a valid JSON object with exactly seven keys:
+"query", "include_tags", "exclude", "release_year",
+"release_year_from", "release_year_to", "supported_languages".
 
 Hard requirements:
 - Output MUST be valid JSON (double quotes, no trailing commas).
@@ -77,6 +80,8 @@ Hard requirements:
   - "include_tags": an array of strings (use [] if none)
   - "exclude": an array of strings (use [] if none)
   - "release_year": an integer year or null
+  - "release_year_from": an integer year or null
+  - "release_year_to": an integer year or null
   - "supported_languages": an array of strings (use [] if none)
 - Do NOT return JSON as a string (no extra quotes around the whole object).
 - Do NOT add any additional keys.
@@ -101,6 +106,8 @@ Attribute extraction:
 - If a term appears in "exclude", it must NOT appear in "include_tags" or "query".
 - Extract "release_year" only when explicitly requested
   as a single year (otherwise null).
+- Extract "release_year_from" and "release_year_to" only when the user asks
+  for a year range (e.g. between/from-to). For single-year queries keep both null.
 - Extract "supported_languages" only when explicitly requested.
 
 Exclusions and negations:
@@ -112,24 +119,33 @@ Exclusions and negations:
 Examples:
 Input: User query: co-op multiplayer games set in Japan without cats
 Output: {"query":"co-op multiplayer Japan","include_tags":[],"exclude":["cats"],
-"release_year":null,"supported_languages":[]}
+"release_year":null,"release_year_from":null,"release_year_to":null,
+"supported_languages":[]}
 
 Input: User query: battle royale with building, looting resources, and combat
 Output: {"query":"battle royale building looting combat","include_tags":[],
-"exclude":[],"release_year":null,"supported_languages":[]}
+"exclude":[],"release_year":null,"release_year_from":null,
+"release_year_to":null,"supported_languages":[]}
 
 Input: User query: puzzle game not horror, no gore
 Output: {"query":"puzzle","include_tags":[],"exclude":["horror","gore"],
-"release_year":null,"supported_languages":[]}
+"release_year":null,"release_year_from":null,"release_year_to":null,
+"supported_languages":[]}
 
 Input: User query: i want to play something like cyberpunk but with cats, no multiplayer
 Output: {"query":"cyberpunk cats futuristic sci-fi single player",
 "include_tags":["cyberpunk","cats"],"exclude":["multiplayer"],
-"release_year":null,"supported_languages":[]}
+"release_year":null,"release_year_from":null,"release_year_to":null,
+"supported_languages":[]}
 
 Input: User query: french hidden object game from 2022 without timer
 Output: {"query":"hidden object","include_tags":[],"exclude":["timer"],
-"release_year":2022,"supported_languages":["french"]}
+"release_year":2022,"release_year_from":null,"release_year_to":null,
+"supported_languages":["french"]}
+
+Input: User query: show me games released between 2014 and 2016
+Output: {"query":"games","include_tags":[],"exclude":[],"release_year":null,
+"release_year_from":2014,"release_year_to":2016,"supported_languages":[]}
 """.strip()
 
 BASELINE_SYSTEM_PROMPT = """
@@ -154,7 +170,8 @@ Input format:
 - Use only that text as the input query to rewrite.
 
 Rewrite rules:
-- "query" must be short, English, keyword-rich, suitable for hybrid (keyword + vector) search.
+- "query" must be short, English, keyword-rich,
+  suitable for hybrid (keyword + vector) search.
 - Prefer 5–20 keywords / short phrases, not full sentences (less noise for embeddings).
 - Preserve user-provided keywords/tags (do not drop them).
 - Preserve concrete mechanic/mode/tag terms literally (helps keyword stage).
@@ -166,7 +183,8 @@ Exclusions:
 - If the user explicitly excludes something via negation (no/without/not/avoid/exclude),
   add that term to "exclude".
 - "exclude" items should be simple keywords/tags, lowercase, no punctuation.
-- Exclusions have priority over the main query. If a term is in "exclude", it should not appear in "query".
+- Exclusions have priority over the main query.
+  If a term is in "exclude", it should not appear in "query".
 - If there are no exclusions, return "exclude": [].
 
 Examples:
@@ -196,7 +214,7 @@ LLM_MAX_TOKENS = 120
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 OUTPUT_DIR = PROJECT_ROOT / "output"
-OUTPUT_FILE = "claude_p6_emb_15"
+OUTPUT_FILE = "batchtest_emb_15"
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "batch_test.log"
 
@@ -290,6 +308,56 @@ def _to_int(val: Any) -> int | None:
     if parsed is None:
         return None
     return int(parsed)
+
+
+def _to_year(val: Any) -> int | None:
+    parsed = _to_int(val)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def _match_release_year_filters(
+    *,
+    release_year: int | None,
+    release_year_from: int | None,
+    release_year_to: int | None,
+    known_years: set[int],
+) -> tuple[int | None, int | None, int | None]:
+    if release_year is not None:
+        if not known_years or release_year in known_years:
+            return release_year, None, None
+        return None, None, None
+
+    year_from = release_year_from
+    year_to = release_year_to
+    if year_from is None and year_to is None:
+        return None, None, None
+
+    if year_from is not None and year_to is not None and year_from > year_to:
+        year_from, year_to = year_to, year_from
+
+    if known_years:
+        min_known = min(known_years)
+        max_known = max(known_years)
+
+        if year_from is not None:
+            year_from = max(year_from, min_known)
+            if year_from > max_known:
+                year_from = None
+
+        if year_to is not None:
+            year_to = min(year_to, max_known)
+            if year_to < min_known:
+                year_to = None
+
+        if year_from is not None and year_to is not None and year_from > year_to:
+            return None, None, None
+
+    if year_from is not None and year_to is not None and year_from == year_to:
+        return year_from, None, None
+
+    return None, year_from, year_to
 
 
 def _meta_get(meta: dict[str, Any], key: str) -> Any:
@@ -549,13 +617,21 @@ def _should_retry_without_attribute_filters(
     tags: list[str],
     supported_languages: list[str],
     release_year: int | None,
+    release_year_from: int | None = None,
+    release_year_to: int | None = None,
     result_count: int,
 ) -> bool:
     if not use_attribute_filters:
         return False
     if result_count > 0:
         return False
-    return bool(tags or supported_languages or release_year is not None)
+    return bool(
+        tags
+        or supported_languages
+        or release_year is not None
+        or release_year_from is not None
+        or release_year_to is not None
+    )
 
 
 def _requests_file_path(out_path: Path) -> Path:
@@ -763,11 +839,15 @@ def run_batch(
                     include_tags_raw: list[str] = []
                     include_langs_raw: list[str] = []
                     year_int: int | None = None
+                    year_from_int: int | None = None
+                    year_to_int: int | None = None
                     matched_tags: list[str] = []
                     unknown_tags: list[str] = []
                     matched_langs: list[str] = []
                     unknown_langs: list[str] = []
                     matched_year: int | None = None
+                    matched_year_from: int | None = None
+                    matched_year_to: int | None = None
 
                     if cfg["use_llm"]:
                         t0 = time.perf_counter()
@@ -792,6 +872,8 @@ def run_batch(
                                 "exclude": [],
                                 "include_tags": [],
                                 "release_year": None,
+                                "release_year_from": None,
+                                "release_year_to": None,
                                 "supported_languages": [],
                             }
 
@@ -805,14 +887,9 @@ def run_batch(
                         include_langs_raw = _normalize_values(
                             list(rewrite.get("supported_languages") or [])
                         )
-                        year_raw = rewrite.get("release_year")
-                        if year_raw is None or isinstance(year_raw, bool):
-                            year_int = None
-                        else:
-                            try:
-                                year_int = int(year_raw)
-                            except (TypeError, ValueError):
-                                year_int = None
+                        year_int = _to_year(rewrite.get("release_year"))
+                        year_from_int = _to_year(rewrite.get("release_year_from"))
+                        year_to_int = _to_year(rewrite.get("release_year_to"))
 
                         rew_ms = round((time.perf_counter() - t0) * 1000)
                         rew_err = err or ""
@@ -830,14 +907,25 @@ def run_batch(
                         matched_langs, unknown_langs = _match_known(
                             include_langs_raw, langs_known
                         )
-                        matched_year = year_int if year_int in years_known else None
+                        matched_year, matched_year_from, matched_year_to = (
+                            _match_release_year_filters(
+                                release_year=year_int,
+                                release_year_from=year_from_int,
+                                release_year_to=year_to_int,
+                                known_years=years_known,
+                            )
+                        )
 
                     requested_attr_tags = matched_tags if use_attr else []
                     requested_attr_langs = matched_langs if use_attr else []
                     requested_attr_year = matched_year if use_attr else None
+                    requested_attr_year_from = matched_year_from if use_attr else None
+                    requested_attr_year_to = matched_year_to if use_attr else None
                     applied_attr_tags = requested_attr_tags
                     applied_attr_langs = requested_attr_langs
                     applied_attr_year = requested_attr_year
+                    applied_attr_year_from = requested_attr_year_from
+                    applied_attr_year_to = requested_attr_year_to
                     attr_filters_relaxed = False
 
                     t1 = time.perf_counter()
@@ -852,6 +940,8 @@ def run_batch(
                         tags=applied_attr_tags,
                         supported_languages=applied_attr_langs,
                         release_year=applied_attr_year,
+                        release_year_from=applied_attr_year_from,
+                        release_year_to=applied_attr_year_to,
                     )
                     if not isinstance(results, list):
                         results = list(results)
@@ -869,12 +959,16 @@ def run_batch(
                         tags=applied_attr_tags,
                         supported_languages=applied_attr_langs,
                         release_year=applied_attr_year,
+                        release_year_from=applied_attr_year_from,
+                        release_year_to=applied_attr_year_to,
                         result_count=len(results),
                     ):
                         attr_filters_relaxed = True
                         applied_attr_tags = []
                         applied_attr_langs = []
                         applied_attr_year = None
+                        applied_attr_year_from = None
+                        applied_attr_year_to = None
 
                         results = query_cortex_search_service(
                             session,
@@ -887,6 +981,8 @@ def run_batch(
                             tags=applied_attr_tags,
                             supported_languages=applied_attr_langs,
                             release_year=applied_attr_year,
+                            release_year_from=applied_attr_year_from,
+                            release_year_to=applied_attr_year_to,
                         )
                         if not isinstance(results, list):
                             results = list(results)
@@ -974,16 +1070,28 @@ def run_batch(
                         "supported_languages_matched": matched_langs,
                         "supported_languages_unknown": unknown_langs,
                         "release_year_raw": year_int,
+                        "release_year_from_raw": year_from_int,
+                        "release_year_to_raw": year_to_int,
                         "release_year_matched": matched_year,
+                        "release_year_from_matched": matched_year_from,
+                        "release_year_to_matched": matched_year_to,
                         "attribute_filters_enabled": use_attr,
                         "attribute_filters_relaxed": attr_filters_relaxed,
                         "attribute_filter_tags_requested": requested_attr_tags,
                         "attribute_filter_supported_languages_"
                         "requested": requested_attr_langs,
                         "attribute_filter_release_year_requested": requested_attr_year,
+                        "attribute_filter_release_year_from_requested": (
+                            requested_attr_year_from
+                        ),
+                        "attribute_filter_release_year_to_requested": (
+                            requested_attr_year_to
+                        ),
                         "attribute_filter_tags": applied_attr_tags,
                         "attribute_filter_supported_languages": applied_attr_langs,
                         "attribute_filter_release_year": applied_attr_year,
+                        "attribute_filter_release_year_from": applied_attr_year_from,
+                        "attribute_filter_release_year_to": applied_attr_year_to,
                     }
 
                     request_rows.append(
