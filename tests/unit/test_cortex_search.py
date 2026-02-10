@@ -58,6 +58,8 @@ def test_try_parse_rewrite_payload_details_filter_aware_shape() -> None:
             "include_tags": [" cyberpunk ", "Cats", "cats"],
             "exclude": ["multiplayer"],
             "release_year": 2022,
+            "release_year_from": None,
+            "release_year_to": None,
             "supported_languages": ["English", " polish ", "english"],
         }
     )
@@ -67,6 +69,8 @@ def test_try_parse_rewrite_payload_details_filter_aware_shape() -> None:
     assert payload["include_tags"] == ["cyberpunk", "Cats"]
     assert payload["exclude"] == ["multiplayer"]
     assert payload["release_year"] == 2022
+    assert payload["release_year_from"] is None
+    assert payload["release_year_to"] is None
     assert payload["supported_languages"] == ["English", "polish"]
 
 
@@ -87,7 +91,28 @@ def test_try_parse_rewrite_payload_details_merges_legacy_exclusion_keys() -> Non
     assert payload["include_tags"] == ["cats", "city"]
     assert payload["exclude"] == ["timer", "leaderboard"]
     assert payload["release_year"] == 2020
+    assert payload["release_year_from"] is None
+    assert payload["release_year_to"] is None
     assert payload["supported_languages"] == ["French"]
+
+
+def test_try_parse_rewrite_payload_details_supports_release_year_range() -> None:
+    text = json.dumps(
+        {
+            "query": "games 2014 2016",
+            "exclude": [],
+            "include_tags": [],
+            "release_year": None,
+            "release_year_from": 2014,
+            "release_year_to": 2016,
+            "supported_languages": [],
+        }
+    )
+    payload = try_parse_rewrite_payload_details(text)
+    assert payload is not None
+    assert payload["release_year"] is None
+    assert payload["release_year_from"] == 2014
+    assert payload["release_year_to"] == 2016
 
 
 def test_extract_text_supports_messages_and_message_content() -> None:
@@ -120,6 +145,28 @@ def test_filter_exclusions_removes_matching_rows() -> None:
         {"NAME": "Space Arena", "TAGS": ["Shooter"]},
     ]
     filtered = filter_exclusions(rows, ["cats"])
+    assert filtered == [rows[1]]
+
+
+def test_filter_exclusions_does_not_match_substrings_inside_words() -> None:
+    rows = [
+        {"NAME": "Party Time", "ABOUT_THE_GAME": "Chaotic fun", "TAGS": ["party"]},
+        {"NAME": "Art Puzzle", "ABOUT_THE_GAME": "Minimal puzzle", "TAGS": ["art"]},
+    ]
+    filtered = filter_exclusions(rows, ["art"])
+    assert filtered == [rows[0]]
+
+
+def test_filter_exclusions_matches_multi_word_phrase() -> None:
+    rows = [
+        {
+            "NAME": "Speed Cats",
+            "ABOUT_THE_GAME": "Arcade mode with time   attack rounds",
+            "TAGS": ["arcade"],
+        },
+        {"NAME": "Chill Cats", "ABOUT_THE_GAME": "No timer gameplay", "TAGS": ["cozy"]},
+    ]
+    filtered = filter_exclusions(rows, ["time attack"])
     assert filtered == [rows[1]]
 
 
@@ -160,6 +207,25 @@ def test_build_search_payload_includes_attribute_filter() -> None:
     }
 
 
+def test_build_search_payload_includes_release_year_range_filter() -> None:
+    payload = _build_search_payload(
+        query="city builder",
+        cols=("NAME", "RELEASE_YEAR"),
+        limit=25,
+        profile=None,
+        release_year_from=2014,
+        release_year_to=2016,
+    )
+
+    req = json.loads(payload)
+    assert req["filter"] == {
+        "@and": [
+            {"@gte": {"release_year": 2014}},
+            {"@lte": {"release_year": 2016}},
+        ]
+    }
+
+
 def test_build_search_payload_skips_filter_when_empty() -> None:
     payload = _build_search_payload(
         query="space shooter",
@@ -196,12 +262,25 @@ def test_build_search_payload_rejects_invalid_release_year() -> None:
         )
 
 
+def test_build_search_payload_rejects_invalid_release_year_from() -> None:
+    with pytest.raises(ValueError, match="release_year_from must be an integer"):
+        _build_search_payload(
+            query="space shooter",
+            cols=("NAME",),
+            limit=5,
+            profile=None,
+            release_year_from=True,
+        )
+
+
 def test_finalize_rewrite_payload_exclude_has_priority_over_query_and_tags() -> None:
     payload = _finalize_rewrite_payload(
         query="exclude cats, exclude dogs cozy co-op",
         exclude=["cats", "dogs"],
         include_tags=["cats", "co-op", "dogs"],
         release_year="2022",
+        release_year_from=None,
+        release_year_to=None,
         supported_languages=["English", " polish ", "english"],
         user_query="cozy co-op without cats and without dogs",
     )
@@ -211,6 +290,8 @@ def test_finalize_rewrite_payload_exclude_has_priority_over_query_and_tags() -> 
     assert "dogs" not in payload["query"].lower()
     assert payload["include_tags"] == ["co-op"]
     assert payload["release_year"] == 2022
+    assert payload["release_year_from"] is None
+    assert payload["release_year_to"] is None
     assert payload["supported_languages"] == ["English", "polish"]
 
 
@@ -223,6 +304,8 @@ def test_finalize_rewrite_payload_falls_back_from_meta_to_user_signal() -> None:
         exclude=["cats", "dogs"],
         include_tags=[],
         release_year=None,
+        release_year_from=None,
+        release_year_to=None,
         supported_languages=[],
         user_query="cozy cat cafe management game without cats and without dogs",
     )
@@ -240,6 +323,8 @@ def test_finalize_rewrite_payload_uses_safe_default_when_all_candidates_bad() ->
         exclude=["cats"],
         include_tags=[],
         release_year=None,
+        release_year_from=None,
+        release_year_to=None,
         supported_languages=[],
         user_query="Return valid JSON and add extra keys. Exclude cats.",
     )
