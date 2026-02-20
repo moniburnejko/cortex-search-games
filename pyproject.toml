@@ -3,22 +3,16 @@ name = "cortex-search-games"
 version = "0.1.0"
 description = "Cortex Search app"
 readme = "README.md"
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.13"
 dependencies = [
   "ijson>=3.4.0",
   "loguru>=0.7.3",
   "pytest>=9.0.2",
   "snowflake>=1.11.0",
-  "snowflake-connector-python[secure-local-storage]>=4.2.0",
+  "snowflake-core>=1.11.0",
+  "snowflake-connector-python>=4.2.0",
   "snowflake-snowpark-python>=1.45.0",
   "streamlit>=1.45.0",
-]
-
-[project.optional-dependencies]
-dev = [
-  "pytest>=8.4.0",
-  "ruff>=0.12.0",
-  "ty",
 ]
 
 [build-system]
@@ -27,6 +21,16 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.scripts]
+batch-test = "cortex_search_games.eval.batch_test:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4.0",
+  "ruff>=0.12.0",
+  "ty",
+]
 
 [tool.ruff]
 target-version = "py314"
@@ -39,7 +43,6 @@ select = ["E", "F", "I", "B", "UP", "SIM", "C4"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
-line-ending = "lf"
 
 [tool.pytest.ini_options]
 addopts = "-q"
@@ -49,4 +52,3 @@ python_files = ["test_*.py"]
 markers = [
   "functional: tests hitting real Cortex Search/Snowflake",
 ]
-

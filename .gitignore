@@ -86,5 +86,6 @@ $RECYCLE.BIN/
 *.iml
 
 # project-generated artifacts
+output/
 data/
 todo.md
